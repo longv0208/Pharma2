@@ -1,0 +1,1124 @@
+package dao;
+
+import db.DBContext;
+import model.GoodsReceipt;
+import model.GoodsReceiptItem;
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.Date;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Access to `goods_receipts` + `goods_receipt_items` + (inside the confirm
+ * transaction) `inventory_batches`, `inventory_movements`,
+ * `purchase_order_items` and `purchase_orders`.
+ *
+ * Everything that moves stock happens inside confirmReceipt(...) — ONE JDBC
+ * transaction so a confirmed receipt can never exist without its inventory
+ * update, its movement rows and its PO quantity update (rule.md §28).
+ *
+ * Draft save / update / cancel NEVER touch inventory.
+ */
+public class GoodsReceiptDAO extends DBContext {
+
+    private static final Logger LOG = Logger.getLogger(GoodsReceiptDAO.class.getName());
+
+    /**
+     * Result of a confirmReceipt attempt. A short machine-readable code so the
+     * servlet can map it to a readable ?err= without parsing message text.
+     */
+    public static class ConfirmResult {
+        public final boolean ok;
+        public final String error;
+
+        private ConfirmResult(boolean ok, String error) {
+            this.ok = ok;
+            this.error = error;
+        }
+
+        public static ConfirmResult success() {
+            return new ConfirmResult(true, null);
+        }
+
+        public static ConfirmResult fail(String error) {
+            return new ConfirmResult(false, error);
+        }
+    }
+
+    /* ==================== mapping ==================== */
+    /**
+     * Maps one ResultSet row to a GoodsReceipt. Expects joined columns
+     * supplier_name and received_by_name to be present.
+     */
+    public GoodsReceipt getFromResultSet(ResultSet rs) throws SQLException {
+        GoodsReceipt r = new GoodsReceipt();
+        r.setGoodsReceiptId(rs.getLong("goods_receipt_id"));
+        r.setSupplierId(rs.getLong("supplier_id"));
+        Long poId = rs.getLong("purchase_order_id");
+        if (rs.wasNull()) {
+            poId = null;
+        }
+        r.setPurchaseOrderId(poId);
+        r.setReceivedBy(rs.getLong("received_by"));
+        r.setReceiptDate(rs.getDate("receipt_date"));
+        r.setInvoiceNumber(rs.getString("invoice_number"));
+        r.setNote(rs.getString("note"));
+        r.setStatus(rs.getString("status"));
+        r.setCreatedAt(rs.getTimestamp("created_at"));
+        r.setUpdatedAt(rs.getTimestamp("updated_at"));
+        r.setSupplierName(rs.getString("supplier_name"));
+        r.setReceivedByName(rs.getString("received_by_name"));
+        return r;
+    }
+
+    /**
+     * Maps one ResultSet row to a GoodsReceiptItem. Expects joined columns
+     * product_name and sku.
+     */
+    public GoodsReceiptItem getItemFromResultSet(ResultSet rs) throws SQLException {
+        GoodsReceiptItem item = new GoodsReceiptItem();
+        item.setGoodsReceiptItemId(rs.getLong("goods_receipt_item_id"));
+        item.setGoodsReceiptId(rs.getLong("goods_receipt_id"));
+        Long poItemId = rs.getLong("purchase_order_item_id");
+        if (rs.wasNull()) {
+            poItemId = null;
+        }
+        item.setPurchaseOrderItemId(poItemId);
+        item.setProductId(rs.getLong("product_id"));
+        Long batchId = rs.getLong("batch_id");
+        if (rs.wasNull()) {
+            batchId = null;
+        }
+        item.setBatchId(batchId);
+        Long binId = rs.getLong("bin_id");
+        if (rs.wasNull()) {
+            binId = null;
+        }
+        item.setBinId(binId);
+        item.setBatchNumber(rs.getString("batch_number"));
+        item.setExpiryDate(rs.getDate("expiry_date"));
+        item.setQuantity(rs.getInt("quantity"));
+        item.setCostPrice(rs.getBigDecimal("cost_price"));
+        item.setInspectionResult(rs.getString("inspection_result"));
+        item.setRejectionReason(rs.getString("rejection_reason"));
+        item.setProductName(rs.getString("product_name"));
+        item.setSku(rs.getString("sku"));
+        try {
+            long zid = rs.getLong("zone_id");
+            if (!rs.wasNull()) {
+                item.setZoneId(zid);
+            }
+            long rid = rs.getLong("rack_id");
+            if (!rs.wasNull()) {
+                item.setRackId(rid);
+            }
+            item.setZoneCode(rs.getString("zone_code"));
+            item.setRackCode(rs.getString("rack_code"));
+            item.setBinCode(rs.getString("bin_code"));
+        } catch (SQLException ignored) {
+            // JOIN columns optional on older queries
+        }
+        return item;
+    }
+
+    /* ==================== list / read ==================== */
+    /**
+     * Receipt list — newest first. Optional filters: status + keyword matching
+     * receipt id (exact) or supplier name (LIKE).
+     */
+    public int count(String keyword, String status) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT COUNT(*) FROM goods_receipts gr ");
+        sql.append("JOIN suppliers s ON s.supplier_id = gr.supplier_id ");
+        sql.append("WHERE 1=1 ");
+        appendListFilters(sql, status, keyword);
+        return queryCount(sql.toString(), status, keyword);
+    }
+
+    public List<GoodsReceipt> findAll(String keyword, String status) {
+        return findAll(keyword, status, 0, 0);
+    }
+
+    /** limit &lt;= 0 returns the full filtered list. */
+    public List<GoodsReceipt> findAll(String keyword, String status, int offset, int limit) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT gr.*, s.supplier_name, u.full_name AS received_by_name ");
+        sql.append("FROM goods_receipts gr ");
+        sql.append("JOIN suppliers s ON s.supplier_id = gr.supplier_id ");
+        sql.append("JOIN users u ON u.user_id = gr.received_by ");
+        sql.append("WHERE 1=1 ");
+        appendListFilters(sql, status, keyword);
+        sql.append("ORDER BY gr.goods_receipt_id DESC");
+        if (limit > 0) {
+            sql.append(" LIMIT ? OFFSET ?");
+        }
+
+        List<GoodsReceipt> out = new ArrayList<>();
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return out;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            int i = 1;
+            if (status != null && !status.isEmpty()) {
+                statement.setString(i++, status);
+            }
+            if (keyword != null && !keyword.isEmpty()) {
+                statement.setString(i++, "%" + keyword + "%");
+                long idKeyword = parseLongOrMinusOne(keyword);
+                statement.setLong(i++, idKeyword);
+            }
+            if (limit > 0) {
+                statement.setInt(i++, limit);
+                statement.setInt(i++, Math.max(offset, 0));
+            }
+            resultSet = statement.executeQuery();
+            while (resultSet.next()) {
+                out.add(getFromResultSet(resultSet));
+            }
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findAll failed", ex);
+        } finally {
+            closeResources();
+        }
+        return out;
+    }
+
+    /**
+     * Single receipt by PK with supplier + receiver names joined.
+     */
+    public GoodsReceipt findById(long goodsReceiptId) {
+        String sql = "SELECT gr.*, s.supplier_name, u.full_name AS received_by_name "
+                + "FROM goods_receipts gr "
+                + "JOIN suppliers s ON s.supplier_id = gr.supplier_id "
+                + "JOIN users u ON u.user_id = gr.received_by "
+                + "WHERE gr.goods_receipt_id = ? LIMIT 1";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return null;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setLong(1, goodsReceiptId);
+            resultSet = statement.executeQuery();
+            if (resultSet.next()) {
+                return getFromResultSet(resultSet);
+            }
+            return null;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findById failed", ex);
+            return null;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * All item rows of one receipt with product name + SKU joined.
+     */
+    public List<GoodsReceiptItem> findItems(long goodsReceiptId) {
+        String sql = "SELECT i.*, p.product_name, p.sku, "
+                + "z.zone_id, z.zone_code, r.rack_id, r.rack_code, bn.bin_code "
+                + "FROM goods_receipt_items i "
+                + "JOIN products p ON p.product_id = i.product_id "
+                + "LEFT JOIN storage_bins bn ON bn.bin_id = i.bin_id "
+                + "LEFT JOIN storage_racks r ON r.rack_id = bn.rack_id "
+                + "LEFT JOIN storage_zones z ON z.zone_id = r.zone_id "
+                + "WHERE i.goods_receipt_id = ? "
+                + "ORDER BY i.goods_receipt_item_id ASC";
+        List<GoodsReceiptItem> out = new ArrayList<>();
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return out;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setLong(1, goodsReceiptId);
+            resultSet = statement.executeQuery();
+            while (resultSet.next()) {
+                out.add(getItemFromResultSet(resultSet));
+            }
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findItems failed", ex);
+        } finally {
+            closeResources();
+        }
+        return out;
+    }
+
+    /* ==================== draft writes ==================== */
+    /**
+     * INSERT the receipt header (status BAN_NHAP) + all item rows in one
+     * transaction. Nothing here touches inventory or the PO — a draft is just
+     * unconfirmed receiving work. Returns the generated receipt id, or -1.
+     */
+    public long createDraft(GoodsReceipt receipt, List<GoodsReceiptItem> items) {
+        String insertReceipt = "INSERT INTO goods_receipts "
+                + "(supplier_id, purchase_order_id, received_by, receipt_date, "
+                + " invoice_number, note, status) "
+                + "VALUES (?,?,?,?,?,?,'BAN_NHAP')";
+        String insertItem = "INSERT INTO goods_receipt_items "
+                + "(goods_receipt_id, purchase_order_item_id, product_id, batch_id, bin_id, "
+                + " batch_number, expiry_date, quantity, cost_price, "
+                + " inspection_result, rejection_reason) "
+                + "VALUES (?,?,?,NULL,?,?,?,?,?,?,?)";
+
+        Connection conn = null;
+        PreparedStatement psReceipt = null;
+        PreparedStatement psItem = null;
+        ResultSet keys = null;
+        try {
+            conn = getConnection();
+            if (conn == null) {
+                return -1;
+            }
+            conn.setAutoCommit(false);
+
+            psReceipt = conn.prepareStatement(insertReceipt, Statement.RETURN_GENERATED_KEYS);
+            psReceipt.setLong(1, receipt.getSupplierId());
+            // purchase_order_id is nullable — drafts without a PO are rejected later
+            // by confirmReceipt('nopo'). setLong(null) would NPE on unboxing.
+            if (receipt.getPurchaseOrderId() != null && receipt.getPurchaseOrderId() > 0) {
+                psReceipt.setLong(2, receipt.getPurchaseOrderId());
+            } else {
+                psReceipt.setNull(2, java.sql.Types.BIGINT);
+            }
+            psReceipt.setLong(3, receipt.getReceivedBy());
+            psReceipt.setDate(4, receipt.getReceiptDate());
+            psReceipt.setString(5, receipt.getInvoiceNumber());
+            psReceipt.setString(6, receipt.getNote());
+            psReceipt.executeUpdate();
+
+            keys = psReceipt.getGeneratedKeys();
+            long receiptId = -1;
+            if (keys.next()) {
+                receiptId = keys.getLong(1);
+            }
+            if (receiptId <= 0) {
+                conn.rollback();
+                return -1;
+            }
+
+            psItem = conn.prepareStatement(insertItem);
+            for (GoodsReceiptItem item : items) {
+                psItem.setLong(1, receiptId);
+                if (item.getPurchaseOrderItemId() != null && item.getPurchaseOrderItemId() > 0) {
+                    psItem.setLong(2, item.getPurchaseOrderItemId());
+                } else {
+                    psItem.setNull(2, java.sql.Types.BIGINT);
+                }
+                psItem.setLong(3, item.getProductId());
+                if (item.getBinId() != null && item.getBinId() > 0) {
+                    psItem.setLong(4, item.getBinId());
+                } else {
+                    psItem.setNull(4, java.sql.Types.BIGINT);
+                }
+                psItem.setString(5, item.getBatchNumber());
+                psItem.setDate(6, item.getExpiryDate());
+                psItem.setInt(7, item.getQuantity());
+                psItem.setBigDecimal(8, item.getCostPrice());
+                psItem.setString(9, item.getInspectionResult());
+                psItem.setString(10, item.getRejectionReason());
+                psItem.executeUpdate();
+            }
+
+            conn.commit();
+            return receiptId;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "createDraft failed — rolled back", ex);
+            rollbackQuietly(conn);
+            return -1;
+        } finally {
+            closeQuietly(keys);
+            closeQuietly(psReceipt);
+            closeQuietly(psItem);
+            if (conn != null) {
+                try {
+                    conn.setAutoCommit(true);
+                    conn.close();
+                } catch (SQLException ex) {
+                    LOG.log(Level.WARNING, "closing tx connection failed", ex);
+                }
+            }
+        }
+    }
+
+    /**
+     * Rewrite a BAN_NHAP receipt: header fields + wholesale item replacement,
+     * one transaction. Returns false when the receipt is not a BAN_NHAP
+     * anymore — the status='BAN_NHAP' guard in the UPDATE makes a stale form
+     * a no-op.
+     */
+    public boolean updateDraft(GoodsReceipt receipt, List<GoodsReceiptItem> items) {
+        Connection conn = null;
+        try {
+            conn = getConnection();
+            if (conn == null) {
+                return false;
+            }
+            conn.setAutoCommit(false);
+            boolean ok = updateDraftInTransaction(conn, receipt, items);
+            if (ok) {
+                conn.commit();
+            } else {
+                conn.rollback();
+            }
+            return ok;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "updateDraft failed — rolled back", ex);
+            rollbackQuietly(conn);
+            return false;
+        } finally {
+            closeTxConnection(conn);
+        }
+    }
+
+    /**
+     * Persist edit-form changes and confirm in ONE JDBC transaction so a failed
+     * confirm never leaves a partially saved draft update committed.
+     */
+    public ConfirmResult updateAndConfirmDraft(GoodsReceipt receipt,
+            List<GoodsReceiptItem> items, long performedBy) {
+        Connection conn = null;
+        try {
+            conn = getConnection();
+            if (conn == null) {
+                return ConfirmResult.fail("db");
+            }
+            conn.setAutoCommit(false);
+
+            if (!updateDraftInTransaction(conn, receipt, items)) {
+                conn.rollback();
+                return ConfirmResult.fail("noteditable");
+            }
+
+            ConfirmResult result = confirmReceiptInTransaction(conn,
+                    receipt.getGoodsReceiptId(), performedBy);
+            if (result.ok) {
+                conn.commit();
+            } else {
+                conn.rollback();
+            }
+            return result;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "updateAndConfirmDraft failed — rolled back", ex);
+            rollbackQuietly(conn);
+            return ConfirmResult.fail("db");
+        } finally {
+            closeTxConnection(conn);
+        }
+    }
+
+    /**
+     * Header + item rewrite on an open connection. Does not commit/rollback.
+     * Returns false when the receipt is no longer BAN_NHAP.
+     */
+    private boolean updateDraftInTransaction(Connection conn, GoodsReceipt receipt,
+            List<GoodsReceiptItem> items) throws SQLException {
+        String updateReceipt = "UPDATE goods_receipts SET receipt_date=?, "
+                + "invoice_number=?, note=? "
+                + "WHERE goods_receipt_id=? AND status='BAN_NHAP'";
+        String deleteItems = "DELETE FROM goods_receipt_items WHERE goods_receipt_id=?";
+        String insertItem = "INSERT INTO goods_receipt_items "
+                + "(goods_receipt_id, purchase_order_item_id, product_id, batch_id, bin_id, "
+                + " batch_number, expiry_date, quantity, cost_price, "
+                + " inspection_result, rejection_reason) "
+                + "VALUES (?,?,?,NULL,?,?,?,?,?,?,?)";
+
+        PreparedStatement psReceipt = null;
+        PreparedStatement psDel = null;
+        PreparedStatement psItem = null;
+        try {
+            psReceipt = conn.prepareStatement(updateReceipt);
+            psReceipt.setDate(1, receipt.getReceiptDate());
+            psReceipt.setString(2, receipt.getInvoiceNumber());
+            psReceipt.setString(3, receipt.getNote());
+            psReceipt.setLong(4, receipt.getGoodsReceiptId());
+            if (psReceipt.executeUpdate() == 0) {
+                return false;
+            }
+
+            psDel = conn.prepareStatement(deleteItems);
+            psDel.setLong(1, receipt.getGoodsReceiptId());
+            psDel.executeUpdate();
+
+            psItem = conn.prepareStatement(insertItem);
+            for (GoodsReceiptItem item : items) {
+                psItem.setLong(1, receipt.getGoodsReceiptId());
+                if (item.getPurchaseOrderItemId() != null && item.getPurchaseOrderItemId() > 0) {
+                    psItem.setLong(2, item.getPurchaseOrderItemId());
+                } else {
+                    psItem.setNull(2, java.sql.Types.BIGINT);
+                }
+                psItem.setLong(3, item.getProductId());
+                if (item.getBinId() != null && item.getBinId() > 0) {
+                    psItem.setLong(4, item.getBinId());
+                } else {
+                    psItem.setNull(4, java.sql.Types.BIGINT);
+                }
+                psItem.setString(5, item.getBatchNumber());
+                psItem.setDate(6, item.getExpiryDate());
+                psItem.setInt(7, item.getQuantity());
+                psItem.setBigDecimal(8, item.getCostPrice());
+                psItem.setString(9, item.getInspectionResult());
+                psItem.setString(10, item.getRejectionReason());
+                psItem.executeUpdate();
+            }
+            return true;
+        } finally {
+            closeQuietly(psReceipt);
+            closeQuietly(psDel);
+            closeQuietly(psItem);
+        }
+    }
+
+    /**
+     * BAN_NHAP → DA_HUY guarded by the current status. Cancelling a draft never
+     * touches inventory (a draft has none).
+     */
+    public boolean cancelDraft(long goodsReceiptId) {
+        String sql = "UPDATE goods_receipts SET status='DA_HUY' "
+                + "WHERE goods_receipt_id=? AND status='BAN_NHAP'";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return false;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setLong(1, goodsReceiptId);
+            return statement.executeUpdate() == 1;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "cancelDraft failed", ex);
+            return false;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * True when another non-cancelled receipt already uses this invoice number.
+     * Comparison is trimmed and case-insensitive. The current draft is excluded.
+     */
+    public boolean existsInvoiceNumber(String invoiceNumber, long excludeReceiptId) {
+        if (invoiceNumber == null || invoiceNumber.trim().isEmpty()) {
+            return false;
+        }
+        String sql = "SELECT 1 FROM goods_receipts "
+                + "WHERE LOWER(TRIM(invoice_number)) = LOWER(?) "
+                + "AND status <> 'DA_HUY' AND goods_receipt_id <> ? LIMIT 1";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return false;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setString(1, invoiceNumber.trim());
+            statement.setLong(2, excludeReceiptId);
+            resultSet = statement.executeQuery();
+            return resultSet.next();
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "existsInvoiceNumber failed", ex);
+            return false;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /* ==================== confirm (the critical transaction) ==================== */
+    /**
+     * Confirm a BAN_NHAP receipt in ONE JDBC transaction. Re-reads and
+     * re-validates every row from the DB inside the transaction — nothing the
+     * browser sent is trusted.
+     *
+     * Per CHAP_NHAN item: find-or-create the inventory batch by
+     * (product_id, batch_number), update goods_receipt_items.batch_id, increase
+     * purchase_order_items.received_quantity, insert one NHAP_KHO
+     * inventory_movements row. Then recalculate the PO status and set the
+     * receipt status (DA_XAC_NHAN or CHAP_NHAN_MOT_PHAN). Any failure rolls the
+     * whole thing back.
+     */
+    public ConfirmResult confirmReceipt(long goodsReceiptId, long performedBy) {
+        Connection conn = null;
+        try {
+            conn = getConnection();
+            if (conn == null) {
+                return ConfirmResult.fail("db");
+            }
+            conn.setAutoCommit(false);
+            ConfirmResult result = confirmReceiptInTransaction(conn, goodsReceiptId, performedBy);
+            if (result.ok) {
+                conn.commit();
+            } else {
+                conn.rollback();
+            }
+            return result;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "confirmReceipt failed — rolled back", ex);
+            rollbackQuietly(conn);
+            return ConfirmResult.fail("db");
+        } finally {
+            closeTxConnection(conn);
+        }
+    }
+
+    /**
+     * Confirm steps on an open transaction. Does not commit or rollback —
+     * the caller owns the connection lifecycle. Returns a fail result without
+     * writing further when validation rejects the saved draft.
+     */
+    private ConfirmResult confirmReceiptInTransaction(Connection conn, long goodsReceiptId,
+            long performedBy) throws SQLException {
+        // 1) Re-read the receipt — must still be a BAN_NHAP.
+        GoodsReceipt receipt = loadReceiptForUpdate(conn, goodsReceiptId);
+        if (receipt == null) {
+            return ConfirmResult.fail("notfound");
+        }
+        if (!"BAN_NHAP".equals(receipt.getStatus())) {
+            return ConfirmResult.fail("noteditable");
+        }
+        if (receipt.getInvoiceNumber() == null || receipt.getInvoiceNumber().trim().isEmpty()) {
+            return ConfirmResult.fail("invoicerequired");
+        }
+        if (receipt.getPurchaseOrderId() == null) {
+            return ConfirmResult.fail("nopo");
+        }
+
+        // 2) Re-read the PO — must be open for receiving.
+        PurchaseOrderRow po = loadPurchaseOrder(conn, receipt.getPurchaseOrderId());
+        if (po == null) {
+            return ConfirmResult.fail("ponotfound");
+        }
+        boolean poOpen = "DA_DAT_HANG".equals(po.status) || "DA_NHAN_MOT_PHAN".equals(po.status);
+        if (!poOpen) {
+            return ConfirmResult.fail("poclosed");
+        }
+        if (po.supplierId != receipt.getSupplierId()) {
+            return ConfirmResult.fail("suppliermismatch");
+        }
+
+        // 3) Receipt items + the PO items they belong to.
+        List<GoodsReceiptItem> items = loadReceiptItems(conn, goodsReceiptId);
+        if (items.isEmpty()) {
+            return ConfirmResult.fail("noitems");
+        }
+        Map<Long, PoItemRow> poItems = loadPoItems(conn, receipt.getPurchaseOrderId());
+
+        // Accepted quantity planned per PO item (several batch rows may
+        // point at the same PO item).
+        Map<Long, Integer> acceptedByPoItem = new HashMap<>();
+        LocationDAO locationDao = new LocationDAO();
+
+        boolean sawAccepted = false;
+        boolean sawRejected = false;
+        for (GoodsReceiptItem item : items) {
+            // Every line must reference a real PO item of this PO.
+            Long poItemId = item.getPurchaseOrderItemId();
+            PoItemRow poItem = null;
+            if (poItemId != null) {
+                poItem = poItems.get(poItemId);
+            }
+            if (poItem == null || !poItem.productId.equals(item.getProductId())) {
+                return ConfirmResult.fail("itemnotinpo");
+            }
+
+            if (item.getBatchNumber() == null || item.getBatchNumber().trim().isEmpty()) {
+                return ConfirmResult.fail("batchrequired");
+            }
+            if (item.getExpiryDate() == null) {
+                return ConfirmResult.fail("expiryrequired");
+            }
+            if (item.getQuantity() == null || item.getQuantity() <= 0) {
+                return ConfirmResult.fail("badquantity");
+            }
+            if (item.getCostPrice() == null || item.getCostPrice().signum() < 0) {
+                return ConfirmResult.fail("badcost");
+            }
+
+            String inspection = item.getInspectionResult();
+            if ("CHAP_NHAN".equals(inspection)) {
+                // Medicine that is already expired on the receipt date can
+                // never be accepted — it should have been rejected instead.
+                if (!item.getExpiryDate().after(receipt.getReceiptDate())) {
+                    return ConfirmResult.fail("expired");
+                }
+                if (item.getBinId() == null || item.getBinId() <= 0) {
+                    return ConfirmResult.fail("binrequired");
+                }
+                if (locationDao.findActiveBin(conn, item.getBinId()) == null) {
+                    return ConfirmResult.fail("bininactive");
+                }
+                sawAccepted = true;
+                int planned = 0;
+                Integer already = acceptedByPoItem.get(poItemId);
+                if (already != null) {
+                    planned = already;
+                }
+                planned = planned + item.getQuantity();
+                acceptedByPoItem.put(poItemId, planned);
+            } else if ("TU_CHOI".equals(inspection)) {
+                if (item.getRejectionReason() == null
+                        || item.getRejectionReason().trim().isEmpty()) {
+                    return ConfirmResult.fail("reasonrequired");
+                }
+                sawRejected = true;
+            } else {
+                // CHO_KIEM_TRA or anything else — inspection must be decided.
+                return ConfirmResult.fail("pendingitems");
+            }
+        }
+
+        // Simplified flow: at least one accepted line is required to
+        // confirm — an all-rejected receipt stays BAN_NHAP or gets cancelled.
+        if (!sawAccepted) {
+            return ConfirmResult.fail("allrejected");
+        }
+
+        // 4) Accepted quantities must fit inside the PO remaining amounts.
+        for (Map.Entry<Long, Integer> entry : acceptedByPoItem.entrySet()) {
+            PoItemRow poItem = poItems.get(entry.getKey());
+            int remaining = poItem.orderedQuantity - poItem.receivedQuantity;
+            if (entry.getValue() > remaining) {
+                return ConfirmResult.fail("overdelivered");
+            }
+        }
+
+        // 5) Apply every CHAP_NHAN line: batch, location, movement, PO qty.
+        for (GoodsReceiptItem item : items) {
+            if (!"CHAP_NHAN".equals(item.getInspectionResult())) {
+                continue;
+            }
+            String batchNumber = item.getBatchNumber().trim();
+            long binId = item.getBinId();
+
+            InventoryBatchRow batch = findBatch(conn, item.getProductId(), batchNumber);
+            long batchId;
+            int reservedBefore;
+            String priorStatus = null;
+            java.sql.Date batchExpiry = item.getExpiryDate();
+            if (batch == null) {
+                batchId = insertBatch(conn, item, receipt);
+                if (batchId <= 0) {
+                    return ConfirmResult.fail("db");
+                }
+                reservedBefore = 0;
+            } else {
+                if (!batch.expiryDate.equals(item.getExpiryDate())) {
+                    return ConfirmResult.fail("batchconflict");
+                }
+                batchId = batch.batchId;
+                reservedBefore = batch.reservedQuantity;
+                priorStatus = batch.status;
+                batchExpiry = batch.expiryDate;
+            }
+
+            int onHandBefore = locationDao.getBatchOnHand(conn, batchId);
+            locationDao.addOnHandAtBin(conn, batchId, binId, item.getQuantity());
+            int onHandAfter = locationDao.getBatchOnHand(conn, batchId);
+            refreshBatchStatusAfterReceipt(conn, batchId, batchExpiry, priorStatus, onHandAfter);
+
+            linkReceiptItemToBatch(conn, item.getGoodsReceiptItemId(), batchId, binId);
+            increasePoReceived(conn, item.getPurchaseOrderItemId(), item.getQuantity());
+            locationDao.insertMovementWithBins(conn, batchId, null, binId, performedBy,
+                    "NHAP_KHO", item.getQuantity(), 0,
+                    onHandBefore, onHandAfter, reservedBefore, reservedBefore,
+                    "PHIEU_NHAP_KHO", goodsReceiptId,
+                    "Phiếu nhập kho #" + goodsReceiptId);
+        }
+
+        // 6) PO status from cumulative received quantities.
+        Map<Long, PoItemRow> freshPoItems = loadPoItems(conn, receipt.getPurchaseOrderId());
+        boolean allReceived = true;
+        boolean anyReceived = false;
+        for (PoItemRow poItem : freshPoItems.values()) {
+            if (poItem.receivedQuantity < poItem.orderedQuantity) {
+                allReceived = false;
+            }
+            if (poItem.receivedQuantity > 0) {
+                anyReceived = true;
+            }
+        }
+        if (allReceived) {
+            updatePoStatus(conn, receipt.getPurchaseOrderId(), "DA_NHAN_DU");
+        } else if (anyReceived) {
+            updatePoStatus(conn, receipt.getPurchaseOrderId(), "DA_NHAN_MOT_PHAN");
+        }
+
+        // 7) Receipt status: all-accepted → DA_XAC_NHAN, mix → CHAP_NHAN_MOT_PHAN.
+        String finalStatus;
+        if (sawRejected) {
+            finalStatus = "CHAP_NHAN_MOT_PHAN";
+        } else {
+            finalStatus = "DA_XAC_NHAN";
+        }
+        updateReceiptStatus(conn, goodsReceiptId, finalStatus);
+
+        return ConfirmResult.success();
+    }
+
+    /* ==================== transaction internals ==================== */
+    /** Small row holder for purchase_orders inside the confirm transaction. */
+    private static class PurchaseOrderRow {
+        long purchaseOrderId;
+        long supplierId;
+        String status;
+    }
+
+    /** Small row holder for purchase_order_items inside the confirm transaction. */
+    private static class PoItemRow {
+        long purchaseOrderItemId;
+        Long productId;
+        int orderedQuantity;
+        int receivedQuantity;
+    }
+
+    /** Small row holder for inventory_batches inside the confirm transaction. */
+    private static class InventoryBatchRow {
+        long batchId;
+        Date expiryDate;
+        String status;
+        int onHandQuantity;
+        int reservedQuantity;
+    }
+
+    /** SELECT ... FOR UPDATE so a second confirm on the same receipt waits/fails. */
+    private GoodsReceipt loadReceiptForUpdate(Connection conn, long goodsReceiptId)
+            throws SQLException {
+        String sql = "SELECT gr.*, s.supplier_name, u.full_name AS received_by_name "
+                + "FROM goods_receipts gr "
+                + "JOIN suppliers s ON s.supplier_id = gr.supplier_id "
+                + "JOIN users u ON u.user_id = gr.received_by "
+                + "WHERE gr.goods_receipt_id = ? LIMIT 1 FOR UPDATE";
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setLong(1, goodsReceiptId);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                return getFromResultSet(rs);
+            }
+            return null;
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(ps);
+        }
+    }
+
+    private PurchaseOrderRow loadPurchaseOrder(Connection conn, long purchaseOrderId)
+            throws SQLException {
+        String sql = "SELECT purchase_order_id, supplier_id, status "
+                + "FROM purchase_orders WHERE purchase_order_id = ? LIMIT 1";
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setLong(1, purchaseOrderId);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                PurchaseOrderRow row = new PurchaseOrderRow();
+                row.purchaseOrderId = rs.getLong("purchase_order_id");
+                row.supplierId = rs.getLong("supplier_id");
+                row.status = rs.getString("status");
+                return row;
+            }
+            return null;
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(ps);
+        }
+    }
+
+    private List<GoodsReceiptItem> loadReceiptItems(Connection conn, long goodsReceiptId)
+            throws SQLException {
+        String sql = "SELECT i.*, p.product_name, p.sku, "
+                + "z.zone_id, z.zone_code, r.rack_id, r.rack_code, bn.bin_code "
+                + "FROM goods_receipt_items i "
+                + "JOIN products p ON p.product_id = i.product_id "
+                + "LEFT JOIN storage_bins bn ON bn.bin_id = i.bin_id "
+                + "LEFT JOIN storage_racks r ON r.rack_id = bn.rack_id "
+                + "LEFT JOIN storage_zones z ON z.zone_id = r.zone_id "
+                + "WHERE i.goods_receipt_id = ?";
+        List<GoodsReceiptItem> out = new ArrayList<>();
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setLong(1, goodsReceiptId);
+            rs = ps.executeQuery();
+            while (rs.next()) {
+                out.add(getItemFromResultSet(rs));
+            }
+            return out;
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(ps);
+        }
+    }
+
+    /** PO items keyed by purchase_order_item_id — quantities re-read live. */
+    private Map<Long, PoItemRow> loadPoItems(Connection conn, long purchaseOrderId)
+            throws SQLException {
+        String sql = "SELECT purchase_order_item_id, product_id, "
+                + "ordered_quantity, received_quantity "
+                + "FROM purchase_order_items WHERE purchase_order_id = ?";
+        Map<Long, PoItemRow> out = new HashMap<>();
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setLong(1, purchaseOrderId);
+            rs = ps.executeQuery();
+            while (rs.next()) {
+                PoItemRow row = new PoItemRow();
+                row.purchaseOrderItemId = rs.getLong("purchase_order_item_id");
+                row.productId = rs.getLong("product_id");
+                row.orderedQuantity = rs.getInt("ordered_quantity");
+                row.receivedQuantity = rs.getInt("received_quantity");
+                out.put(row.purchaseOrderItemId, row);
+            }
+            return out;
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(ps);
+        }
+    }
+
+    /** Business key lookup: (product_id, batch_number) is the DB unique key. */
+    private InventoryBatchRow findBatch(Connection conn, long productId, String batchNumber)
+            throws SQLException {
+        String sql = "SELECT batch_id, expiry_date, status, on_hand_quantity, reserved_quantity "
+                + "FROM inventory_batches "
+                + "WHERE product_id = ? AND batch_number = ? LIMIT 1";
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setLong(1, productId);
+            ps.setString(2, batchNumber);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                InventoryBatchRow row = new InventoryBatchRow();
+                row.batchId = rs.getLong("batch_id");
+                row.expiryDate = rs.getDate("expiry_date");
+                row.status = rs.getString("status");
+                row.onHandQuantity = rs.getInt("on_hand_quantity");
+                row.reservedQuantity = rs.getInt("reserved_quantity");
+                return row;
+            }
+            return null;
+        } finally {
+            closeQuietly(rs);
+            closeQuietly(ps);
+        }
+    }
+
+    /** Insert a new batch for an accepted line; status reflects its expiry. */
+    private long insertBatch(Connection conn, GoodsReceiptItem item, GoodsReceipt receipt)
+            throws SQLException {
+        String sql = "INSERT INTO inventory_batches "
+                + "(product_id, supplier_id, source_goods_receipt_id, batch_number, "
+                + " expiry_date, on_hand_quantity, reserved_quantity, cost_price, "
+                + " storage_location, status) "
+                + "VALUES (?,?,?,?,?,?,0,?,NULL,?)";
+        PreparedStatement ps = null;
+        ResultSet keys = null;
+        try {
+            java.sql.Date today = new java.sql.Date(System.currentTimeMillis());
+            ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, item.getProductId());
+            ps.setLong(2, receipt.getSupplierId());
+            ps.setLong(3, receipt.getGoodsReceiptId());
+            ps.setString(4, item.getBatchNumber().trim());
+            ps.setDate(5, item.getExpiryDate());
+            ps.setInt(6, 0);
+            ps.setBigDecimal(7, item.getCostPrice());
+            ps.setString(8, InventoryDAO.statusForExpiry(item.getExpiryDate(), today));
+            ps.executeUpdate();
+            keys = ps.getGeneratedKeys();
+            if (keys.next()) {
+                return keys.getLong(1);
+            }
+            return -1;
+        } finally {
+            closeQuietly(keys);
+            closeQuietly(ps);
+        }
+    }
+
+    /** Refresh batch status cache after location dual-write receipt. */
+    private void refreshBatchStatusAfterReceipt(Connection conn, long batchId,
+            java.sql.Date expiryDate, String priorStatus, int onHandAfter)
+            throws SQLException {
+        String newStatus;
+        if ("BI_KHOA".equals(priorStatus)) {
+            newStatus = "BI_KHOA";
+        } else if (onHandAfter <= 0) {
+            newStatus = "HET_HANG";
+        } else {
+            java.sql.Date today = new java.sql.Date(System.currentTimeMillis());
+            newStatus = InventoryDAO.statusForExpiry(expiryDate, today);
+        }
+        String sql = "UPDATE inventory_batches SET status = ? WHERE batch_id = ?";
+        PreparedStatement ps = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setString(1, newStatus);
+            ps.setLong(2, batchId);
+            ps.executeUpdate();
+        } finally {
+            closeQuietly(ps);
+        }
+    }
+
+    /** Traceability: receipt line points at batch + put-away bin. */
+    private void linkReceiptItemToBatch(Connection conn, long goodsReceiptItemId,
+            long batchId, long binId) throws SQLException {
+        String sql = "UPDATE goods_receipt_items SET batch_id = ?, bin_id = ? "
+                + "WHERE goods_receipt_item_id = ?";
+        PreparedStatement ps = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setLong(1, batchId);
+            ps.setLong(2, binId);
+            ps.setLong(3, goodsReceiptItemId);
+            ps.executeUpdate();
+        } finally {
+            closeQuietly(ps);
+        }
+    }
+
+    /** received_quantity += accepted qty (rejected lines never reach this). */
+    private void increasePoReceived(Connection conn, long purchaseOrderItemId, int quantity)
+            throws SQLException {
+        String sql = "UPDATE purchase_order_items "
+                + "SET received_quantity = received_quantity + ? "
+                + "WHERE purchase_order_item_id = ?";
+        PreparedStatement ps = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setInt(1, quantity);
+            ps.setLong(2, purchaseOrderItemId);
+            ps.executeUpdate();
+        } finally {
+            closeQuietly(ps);
+        }
+    }
+
+    private void updatePoStatus(Connection conn, long purchaseOrderId, String status)
+            throws SQLException {
+        String sql = "UPDATE purchase_orders SET status = ? WHERE purchase_order_id = ?";
+        PreparedStatement ps = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setString(1, status);
+            ps.setLong(2, purchaseOrderId);
+            ps.executeUpdate();
+        } finally {
+            closeQuietly(ps);
+        }
+    }
+
+    private void updateReceiptStatus(Connection conn, long goodsReceiptId, String status)
+            throws SQLException {
+        String sql = "UPDATE goods_receipts SET status = ? WHERE goods_receipt_id = ?";
+        PreparedStatement ps = null;
+        try {
+            ps = conn.prepareStatement(sql);
+            ps.setString(1, status);
+            ps.setLong(2, goodsReceiptId);
+            ps.executeUpdate();
+        } finally {
+            closeQuietly(ps);
+        }
+    }
+
+    /* ==================== small helpers ==================== */
+    private static void appendListFilters(StringBuilder sql, String status, String keyword) {
+        if (status != null && !status.isEmpty()) {
+            sql.append("AND gr.status = ? ");
+        }
+        if (keyword != null && !keyword.isEmpty()) {
+            sql.append("AND (s.supplier_name LIKE ? OR gr.goods_receipt_id = ?) ");
+        }
+    }
+
+    private int queryCount(String sql, String status, String keyword) {
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return 0;
+            }
+            statement = connection.prepareStatement(sql);
+            int i = 1;
+            if (status != null && !status.isEmpty()) {
+                statement.setString(i++, status);
+            }
+            if (keyword != null && !keyword.isEmpty()) {
+                statement.setString(i++, "%" + keyword + "%");
+                statement.setLong(i++, parseLongOrMinusOne(keyword));
+            }
+            resultSet = statement.executeQuery();
+            if (resultSet.next()) {
+                return resultSet.getInt(1);
+            }
+            return 0;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "count failed", ex);
+            return 0;
+        } finally {
+            closeResources();
+        }
+    }
+
+    private static long parseLongOrMinusOne(String s) {
+        try {
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static void rollbackQuietly(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.rollback();
+        } catch (SQLException ex) {
+            LOG.log(Level.WARNING, "rollback failed", ex);
+        }
+    }
+
+    private static void closeTxConnection(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.setAutoCommit(true);
+            conn.close();
+        } catch (SQLException ex) {
+            LOG.log(Level.WARNING, "closing tx connection failed", ex);
+        }
+    }
+
+    private static void closeQuietly(java.lang.AutoCloseable r) {
+        if (r == null) {
+            return;
+        }
+        try {
+            r.close();
+        } catch (Exception ex) {
+            LOG.log(Level.WARNING, "close failed", ex);
+        }
+    }
+}

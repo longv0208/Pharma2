@@ -1,0 +1,745 @@
+package controller;
+
+import dao.GoodsReceiptDAO;
+import dao.GoodsReceiptDAO.ConfirmResult;
+import dao.LocationDAO;
+import dao.PurchaseOrderDAO;
+import model.GoodsReceipt;
+import model.GoodsReceiptItem;
+import model.PurchaseOrder;
+import model.PurchaseOrderItem;
+import model.StorageBin;
+import model.User;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.annotation.WebServlet;
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.sql.Date;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * /inventory/receipts — Stock Receiving (goods receipts against purchase
+ * orders). Dispatch via ?action= param (rule.md §22).
+ *
+ * Actions (GET): list (default), new, edit, detail Actions (POST): create,
+ * update, confirm, cancel
+ *
+ * Roles: CHU_QUAN_QUAN_TRI and NHAN_VIEN may receive medicine — everything else
+ * is bounced to login. The gate runs on every request, not just hidden links.
+ *
+ * A BAN_NHAP receipt touches nothing outside its own tables. Only "confirm"
+ * moves stock — inside one JDBC transaction in GoodsReceiptDAO.
+ */
+@WebServlet(name = "GoodsReceiptServlet", urlPatterns = {"/inventory/receipts"})
+public class GoodsReceiptServlet extends HttpServlet {
+
+    private static final int PAGE_SIZE = 20;
+    private static final String LIST_URL = "/inventory/receipts";
+    private static final String FORM_JSP = "/WEB-INF/views/admin/goods-receipt-form.jsp";
+    private static final String LIST_JSP = "/WEB-INF/views/admin/goods-receipt-list.jsp";
+    private static final String DETAIL_JSP = "/WEB-INF/views/admin/goods-receipt-detail.jsp";
+
+    @Override
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        User user = requireReceiver(req, resp);
+        if (user == null) {
+            return;
+        }
+        String action = req.getParameter("action");
+        if (action == null) {
+            action = "list";
+        }
+
+        switch (action) {
+            case "new":
+                handleNewForm(req, resp);
+                break;
+            case "edit":
+                handleEditForm(req, resp);
+                break;
+            case "detail":
+                handleDetail(req, resp);
+                break;
+            default:
+                handleList(req, resp);
+                break;
+        }
+    }
+
+    @Override
+    protected void doPost(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        User user = requireReceiver(req, resp);
+        if (user == null) {
+            return;
+        }
+        String action = req.getParameter("action");
+        if (action == null) {
+            resp.sendError(HttpServletResponse.SC_BAD_REQUEST);
+            return;
+        }
+
+        switch (action) {
+            case "create":
+                handleCreate(req, resp, user);
+                break;
+            case "update":
+                handleUpdate(req, resp);
+                break;
+            case "confirm":
+                handleConfirm(req, resp, user);
+                break;
+            case "cancel":
+                handleCancel(req, resp);
+                break;
+            default:
+                resp.sendError(HttpServletResponse.SC_BAD_REQUEST);
+                break;
+        }
+    }
+
+    /* ==================== GET handlers ==================== */
+    private void handleList(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        String keyword = trim(req.getParameter("q"));
+        String status = trimOrNull(req.getParameter("status"));
+
+        GoodsReceiptDAO dao = new GoodsReceiptDAO();
+        int total = dao.count(keyword, status);
+        int totalPages = (int) Math.ceil(total / (double) PAGE_SIZE);
+        if (totalPages < 1) {
+            totalPages = 1;
+        }
+        int page = parsePage(req.getParameter("page"));
+        if (page > totalPages) {
+            page = totalPages;
+        }
+        req.setAttribute("receipts", dao.findAll(keyword, status, (page - 1) * PAGE_SIZE, PAGE_SIZE));
+        req.setAttribute("page", page);
+        req.setAttribute("totalPages", totalPages);
+        req.setAttribute("total", total);
+        req.getRequestDispatcher(LIST_JSP).forward(req, resp);
+    }
+
+    private void handleNewForm(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        req.setAttribute("mode", "create");
+        req.setAttribute("receivableOrders", new PurchaseOrderDAO().findReceivable());
+
+        // A PO was picked? The form reloads via GET (?po=N) so the item lines
+        // are rebuilt server-side with ordered/received/remaining context.
+        GoodsReceipt draft = new GoodsReceipt();
+        draft.setPurchaseOrderId(parseIdOrNull(req.getParameter("po")));
+        draft.setReceiptDate(parseDate(req.getParameter("receiptDate")));
+        draft.setInvoiceNumber(trim(req.getParameter("invoiceNumber")));
+        draft.setNote(trim(req.getParameter("note")));
+        req.setAttribute("receipt", draft);
+
+        if (draft.getPurchaseOrderId() != null && draft.getPurchaseOrderId() > 0) {
+            loadPoContext(req, draft.getPurchaseOrderId());
+        }
+        loadActiveZones(req);
+        req.getRequestDispatcher(FORM_JSP).forward(req, resp);
+    }
+
+    private void handleEditForm(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        long id = parseId(req.getParameter("id"));
+        GoodsReceiptDAO dao = new GoodsReceiptDAO();
+        GoodsReceipt receipt = null;
+        if (id > 0) {
+            receipt = dao.findById(id);
+        }
+        if (receipt == null) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?err=notfound");
+            return;
+        }
+        if (!receipt.isEditable()) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?action=detail&id=" + id
+                    + "&err=noteditable");
+            return;
+        }
+
+        req.setAttribute("mode", "edit");
+        req.setAttribute("receipt", receipt);
+        req.setAttribute("items", dao.findItems(id));
+        if (receipt.getPurchaseOrderId() != null) {
+            loadPoContext(req, receipt.getPurchaseOrderId());
+        }
+        loadActiveZones(req);
+        req.getRequestDispatcher(FORM_JSP).forward(req, resp);
+    }
+
+    private void handleDetail(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        long id = parseId(req.getParameter("id"));
+        GoodsReceiptDAO dao = new GoodsReceiptDAO();
+        GoodsReceipt receipt = null;
+        if (id > 0) {
+            receipt = dao.findById(id);
+        }
+        if (receipt == null) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?err=notfound");
+            return;
+        }
+        req.setAttribute("receipt", receipt);
+        req.setAttribute("items", dao.findItems(id));
+        if (receipt.getPurchaseOrderId() != null) {
+            req.setAttribute("order", new PurchaseOrderDAO().findById(receipt.getPurchaseOrderId()));
+        }
+        req.getRequestDispatcher(DETAIL_JSP).forward(req, resp);
+    }
+
+    /* ==================== POST handlers ==================== */
+    /**
+     * Save Draft for a NEW receipt. Items are kept raw — the strict inspection
+     * rules only apply at confirm time, a draft may still hold PENDING lines.
+     */
+    private void handleCreate(HttpServletRequest req, HttpServletResponse resp, User user)
+            throws ServletException, IOException {
+        GoodsReceipt receipt = readReceiptForm(req);
+        List<GoodsReceiptItem> items = readItemsForm(req);
+
+        Map<String, String> errors = validateReceipt(receipt, items, false);
+        if (!errors.isEmpty()) {
+            repopulateForm(req, resp, "create", receipt, items, errors);
+            return;
+        }
+
+        receipt.setStatus("BAN_NHAP");
+        receipt.setReceivedBy(user.getUserId());
+
+        long receiptId = new GoodsReceiptDAO().createDraft(receipt, items);
+        if (receiptId <= 0) {
+            errors.put("form", "Could not save the receipt. Please try again.");
+            repopulateForm(req, resp, "create", receipt, items, errors);
+            return;
+        }
+        resp.sendRedirect(req.getContextPath() + LIST_URL + "?ok=created");
+    }
+
+    /**
+     * Save changes on a BAN_NHAP receipt. The BAN_NHAP guard lives in the DAO's
+     * WHERE clause too — a stale form cannot rewrite a confirmed receipt.
+     */
+    private void handleUpdate(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        long id = parseId(req.getParameter("goodsReceiptId"));
+        GoodsReceiptDAO dao = new GoodsReceiptDAO();
+        GoodsReceipt existing = null;
+        if (id > 0) {
+            existing = dao.findById(id);
+        }
+        if (existing == null) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?err=notfound");
+            return;
+        }
+        if (!existing.isEditable()) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?action=detail&id=" + id
+                    + "&err=noteditable");
+            return;
+        }
+
+        GoodsReceipt receipt = readReceiptForm(req);
+        receipt.setGoodsReceiptId(id);
+        // PO + supplier + receiver stay as originally saved.
+        receipt.setPurchaseOrderId(existing.getPurchaseOrderId());
+        receipt.setSupplierId(existing.getSupplierId());
+        receipt.setReceivedBy(existing.getReceivedBy());
+        List<GoodsReceiptItem> items = readItemsForm(req);
+
+        Map<String, String> errors = validateReceipt(receipt, items, false);
+        if (!errors.isEmpty()) {
+            repopulateForm(req, resp, "edit", receipt, items, errors);
+            return;
+        }
+
+        boolean saved = dao.updateDraft(receipt, items);
+        if (!saved) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?action=detail&id=" + id
+                    + "&err=noteditable");
+            return;
+        }
+        resp.sendRedirect(req.getContextPath() + LIST_URL + "?ok=updated");
+    }
+
+    /**
+     * Confirm Receipt — the only action that moves stock.
+     *
+     * Two explicit sources (confirmSource), never inferred from empty fields:
+     * <ul>
+     *   <li>{@code saved} — detail page: confirm the BAN_NHAP row already in DB</li>
+     *   <li>{@code form} — edit form: validate submitted edits, then
+     *       update+confirm in one JDBC transaction</li>
+     * </ul>
+     */
+    private void handleConfirm(HttpServletRequest req, HttpServletResponse resp, User user)
+            throws ServletException, IOException {
+        long id = parseId(req.getParameter("goodsReceiptId"));
+        GoodsReceiptDAO dao = new GoodsReceiptDAO();
+        GoodsReceipt receipt = null;
+        if (id > 0) {
+            receipt = dao.findById(id);
+        }
+        if (receipt == null) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?err=notfound");
+            return;
+        }
+        if (!receipt.isEditable()) {
+            // A confirmed/cancelled receipt must not be processed twice.
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?action=detail&id=" + id
+                    + "&err=noteditable");
+            return;
+        }
+
+        String confirmSource = trim(req.getParameter("confirmSource"));
+        ConfirmResult result;
+        if ("form".equals(confirmSource)) {
+            result = confirmFromForm(req, resp, dao, receipt, id, user);
+            if (result == null) {
+                return; // validation forward already done
+            }
+        } else {
+            // The saved draft is the source of truth for the detail page and the default path.
+            result = dao.confirmReceipt(id, user.getUserId());
+        }
+
+        if (result.ok) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL
+                    + "?action=detail&id=" + id + "&ok=confirmed");
+        } else {
+            // GET edit reloads saved draft — never overwrite DB with empty request data.
+            resp.sendRedirect(req.getContextPath() + LIST_URL
+                    + "?action=edit&id=" + id + "&err=" + result.error);
+        }
+    }
+
+    /**
+     * Edit-form confirm: validate posted fields, then atomically save + confirm.
+     * Returns null when the response was already forwarded (validation errors).
+     */
+    private ConfirmResult confirmFromForm(HttpServletRequest req, HttpServletResponse resp,
+            GoodsReceiptDAO dao, GoodsReceipt existing, long id, User user)
+            throws ServletException, IOException {
+        GoodsReceipt updated = readReceiptForm(req);
+        updated.setGoodsReceiptId(id);
+        // PO + supplier + receiver stay as originally saved.
+        updated.setPurchaseOrderId(existing.getPurchaseOrderId());
+        updated.setSupplierId(existing.getSupplierId());
+        updated.setReceivedBy(existing.getReceivedBy());
+        List<GoodsReceiptItem> items = readItemsForm(req);
+
+        // strict=true: inspection must be decided before confirm (preserves POST on fail).
+        Map<String, String> errors = validateReceipt(updated, items, true);
+        if (!errors.isEmpty()) {
+            repopulateForm(req, resp, "edit", updated, items, errors);
+            return null;
+        }
+
+        return dao.updateAndConfirmDraft(updated, items, user.getUserId());
+    }
+
+    /**
+     * BAN_NHAP → DA_HUY. Never touches inventory — a draft has none.
+     */
+    private void handleCancel(HttpServletRequest req, HttpServletResponse resp)
+            throws IOException {
+        long id = parseId(req.getParameter("goodsReceiptId"));
+        GoodsReceiptDAO dao = new GoodsReceiptDAO();
+        GoodsReceipt receipt = null;
+        if (id > 0) {
+            receipt = dao.findById(id);
+        }
+        if (receipt == null) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?err=notfound");
+            return;
+        }
+        if (!receipt.isCancellable()) {
+            resp.sendRedirect(req.getContextPath() + LIST_URL + "?action=detail&id=" + id
+                    + "&err=notcancellable");
+            return;
+        }
+        dao.cancelDraft(id);
+        resp.sendRedirect(req.getContextPath() + LIST_URL + "?ok=cancelled");
+    }
+
+    /* ==================== form reading ==================== */
+    private GoodsReceipt readReceiptForm(HttpServletRequest req) {
+        GoodsReceipt r = new GoodsReceipt();
+        r.setPurchaseOrderId(parseIdOrNull(req.getParameter("purchaseOrderId")));
+        r.setReceiptDate(parseDate(req.getParameter("receiptDate")));
+        r.setInvoiceNumber(trim(req.getParameter("invoiceNumber")));
+        r.setNote(trim(req.getParameter("note")));
+        return r;
+    }
+
+    /**
+     * Reads received-batch rows: parallel arrays poItemId[] / batchNumber[] /
+     * expiryDate[] / quantity[] / costPrice[] / inspectionResult[] /
+     * rejectionReason[]. Rows without a PO item picked are skipped; everything
+     * else is kept raw — validation lives in validateReceipt.
+     */
+    private List<GoodsReceiptItem> readItemsForm(HttpServletRequest req) {
+        String[] poItemIds = req.getParameterValues("poItemId");
+        String[] batchNumbers = req.getParameterValues("batchNumber");
+        String[] expiryDates = req.getParameterValues("expiryDate");
+        String[] quantities = req.getParameterValues("quantity");
+        String[] costPrices = req.getParameterValues("costPrice");
+        String[] inspections = req.getParameterValues("inspectionResult");
+        String[] reasons = req.getParameterValues("rejectionReason");
+        String[] binIds = req.getParameterValues("binId");
+
+        List<GoodsReceiptItem> items = new ArrayList<>();
+        if (poItemIds == null) {
+            return items;
+        }
+        for (int i = 0; i < poItemIds.length; i++) {
+            long poItemId = parseId(poItemIds[i]);
+            if (poItemId <= 0) {
+                continue;   // empty row — added a line but picked no product
+            }
+            GoodsReceiptItem item = new GoodsReceiptItem();
+            item.setPurchaseOrderItemId(poItemId);
+            item.setBatchNumber(trim(at(batchNumbers, i)));
+            item.setExpiryDate(parseDate(at(expiryDates, i)));
+            item.setQuantity((int) parseId(at(quantities, i)));
+            String costRaw = trim(at(costPrices, i));
+            try {
+                item.setCostPrice(new BigDecimal(costRaw));
+            } catch (NumberFormatException e) {
+                item.setCostPrice(new BigDecimal("-1"));  // invalid → caught by validation
+            }
+            String inspection = trim(at(inspections, i));
+            if (inspection.isEmpty()) {
+                inspection = "CHO_KIEM_TRA";
+            }
+            item.setInspectionResult(inspection);
+            item.setRejectionReason(trim(at(reasons, i)));
+            long binId = parseId(at(binIds, i));
+            if (binId > 0) {
+                item.setBinId(binId);
+                StorageBin bin = new LocationDAO().findBinById(binId);
+                if (bin != null) {
+                    item.setZoneId(bin.getZoneId());
+                    item.setRackId(bin.getRackId());
+                }
+            }
+            items.add(item);
+        }
+        return items;
+    }
+
+    /* ==================== validation ==================== */
+    /**
+     * Backend-authoritative validation for saving / confirming a receipt.
+     * When {@code strict} is true (confirm-from-form), every line must already
+     * be CHAP_NHAN or TU_CHOI and at least one line must be accepted — so the
+     * servlet can forward with posted data instead of rolling back in the DAO.
+     * Saved-detail confirm still re-validates inside GoodsReceiptDAO.
+     */
+    private Map<String, String> validateReceipt(GoodsReceipt receipt,
+            List<GoodsReceiptItem> items, boolean strict) {
+        Map<String, String> errors = new HashMap<>();
+        PurchaseOrderDAO poDao = new PurchaseOrderDAO();
+
+        // --- purchase order: required + receivable ---
+        PurchaseOrder po = null;
+        if (receipt.getPurchaseOrderId() == null || receipt.getPurchaseOrderId() <= 0) {
+            errors.put("purchaseOrderId", "Please choose a purchase order.");
+        } else {
+            po = poDao.findById(receipt.getPurchaseOrderId());
+            if (po == null) {
+                errors.put("purchaseOrderId", "Purchase order not found.");
+            } else {
+                boolean open = "DA_DAT_HANG".equals(po.getStatus())
+                        || "DA_NHAN_MOT_PHAN".equals(po.getStatus());
+                if (!open) {
+                    errors.put("purchaseOrderId",
+                            "This purchase order is not open for receiving.");
+                }
+            }
+        }
+        if (po != null) {
+            receipt.setSupplierId(po.getSupplierId());
+        }
+
+        String invoice = receipt.getInvoiceNumber();
+        if (invoice == null || invoice.isEmpty()) {
+            errors.put("invoiceNumber", "Số hóa đơn là bắt buộc.");
+        } else if (invoice.length() > 100) {
+            errors.put("invoiceNumber", "Số hóa đơn tối đa 100 ký tự.");
+        } else {
+            long excludeId = receipt.getGoodsReceiptId() == null ? 0L : receipt.getGoodsReceiptId();
+            if (new GoodsReceiptDAO().existsInvoiceNumber(invoice, excludeId)) {
+                errors.put("invoiceNumber", "Số hóa đơn đã tồn tại.");
+            }
+        }
+
+        // --- receipt date: required, not in the future ---
+        if (receipt.getReceiptDate() == null) {
+            errors.put("receiptDate", "Receipt date is required.");
+        } else {
+            Date today = new Date(System.currentTimeMillis());
+            if (receipt.getReceiptDate().after(today)) {
+                errors.put("receiptDate", "Receipt date cannot be in the future.");
+            }
+        }
+
+        // --- items: at least one batch line ---
+        if (items.isEmpty()) {
+            errors.put("items", "Add at least one received batch line.");
+        }
+
+        // --- per-item rules ---
+        Map<Long, PurchaseOrderItem> poItemById = new HashMap<>();
+        if (po != null) {
+            List<PurchaseOrderItem> poItems = poDao.findItems(po.getPurchaseOrderId());
+            for (PurchaseOrderItem poItem : poItems) {
+                poItemById.put(poItem.getPurchaseOrderItemId(), poItem);
+            }
+        }
+
+        boolean itemNotInPo = false;
+        boolean batchMissing = false;
+        boolean expiryMissing = false;
+        boolean expired = false;
+        boolean badQty = false;
+        boolean badCost = false;
+        boolean badInspection = false;
+        boolean pendingInspection = false;
+        boolean reasonMissing = false;
+        boolean binMissing = false;
+        boolean sawAccepted = false;
+        Map<Long, Integer> acceptedByPoItem = new HashMap<>();
+
+        for (GoodsReceiptItem item : items) {
+            PurchaseOrderItem poItem = poItemById.get(item.getPurchaseOrderItemId());
+            if (poItem == null) {
+                itemNotInPo = true;
+                continue;
+            }
+            item.setProductId(poItem.getProductId());   // trust the PO, not the form
+
+            if (item.getBatchNumber() == null || item.getBatchNumber().isEmpty()) {
+                batchMissing = true;
+            }
+            if (item.getExpiryDate() == null) {
+                expiryMissing = true;
+            } else if (receipt.getReceiptDate() != null
+                    && !item.getExpiryDate().after(receipt.getReceiptDate())
+                    && "CHAP_NHAN".equals(item.getInspectionResult())) {
+                expired = true;   // expired medicine must be TU_CHOI, not accepted
+            }
+            if (item.getQuantity() == null || item.getQuantity() <= 0) {
+                badQty = true;
+            }
+            if (item.getCostPrice() == null || item.getCostPrice().signum() < 0) {
+                badCost = true;
+            }
+            String inspection = item.getInspectionResult();
+            if (!"CHO_KIEM_TRA".equals(inspection) && !"CHAP_NHAN".equals(inspection)
+                    && !"TU_CHOI".equals(inspection)) {
+                badInspection = true;
+            }
+            if (strict && "CHO_KIEM_TRA".equals(inspection)) {
+                pendingInspection = true;
+            }
+            if ("TU_CHOI".equals(inspection)
+                    && (item.getRejectionReason() == null
+                    || item.getRejectionReason().isEmpty())) {
+                reasonMissing = true;
+            }
+            if ("CHAP_NHAN".equals(inspection)) {
+                sawAccepted = true;
+                if (item.getBinId() == null || item.getBinId() <= 0) {
+                    binMissing = true;
+                }
+            }
+            if ("CHAP_NHAN".equals(inspection) && item.getQuantity() != null
+                    && item.getQuantity() > 0) {
+                int planned = 0;
+                Integer already = acceptedByPoItem.get(item.getPurchaseOrderItemId());
+                if (already != null) {
+                    planned = already;
+                }
+                planned = planned + item.getQuantity();
+                acceptedByPoItem.put(item.getPurchaseOrderItemId(), planned);
+            }
+        }
+
+        // accepted-now must fit inside what the PO still expects
+        boolean overdelivered = false;
+        for (Map.Entry<Long, Integer> entry : acceptedByPoItem.entrySet()) {
+            PurchaseOrderItem poItem = poItemById.get(entry.getKey());
+            if (poItem == null) {
+                continue;
+            }
+            int remaining = poItem.getOrderedQuantity() - poItem.getReceivedQuantity();
+            if (entry.getValue() > remaining) {
+                overdelivered = true;
+            }
+        }
+
+        if (itemNotInPo) {
+            errors.put("items", "Every line must be a product of the selected purchase order.");
+        } else if (batchMissing) {
+            errors.put("items", "Batch number is required on every line.");
+        } else if (expiryMissing) {
+            errors.put("items", "Expiry date is required on every line.");
+        } else if (expired) {
+            errors.put("items",
+                    "Thuốc đã hết hạn vào ngày nhận không thể được chấp nhận — hãy đánh dấu Từ chối.");
+        } else if (badQty) {
+            errors.put("items", "Quantity must be greater than 0.");
+        } else if (badCost) {
+            errors.put("items", "Cost price must be 0 or greater.");
+        } else if (badInspection) {
+            errors.put("items", "Kết quả kiểm tra phải là Chờ kiểm tra, Chấp nhận hoặc Từ chối.");
+        } else if (pendingInspection) {
+            errors.put("items",
+                    "Mọi dòng phải được kiểm tra — đặt Chấp nhận hoặc Từ chối trước khi xác nhận.");
+        } else if (reasonMissing) {
+            errors.put("items", "A rejection reason is required for every rejected line.");
+        } else if (binMissing) {
+            errors.put("items", "Mỗi dòng Chấp nhận phải chọn Khu / Kệ / Ngăn đặt hàng.");
+        } else if (overdelivered) {
+            errors.put("items",
+                    "Accepted quantity exceeds the remaining quantity on the purchase order.");
+        } else if (strict && !items.isEmpty() && !sawAccepted) {
+            errors.put("items",
+                    "Phải có ít nhất một dòng được chấp nhận để xác nhận nhập kho.");
+        }
+        return errors;
+    }
+
+    /* ==================== helpers ==================== */
+    /**
+     * Gate: must be logged in as CHU_QUAN_QUAN_TRI or NHAN_VIEN. Returns null after
+     * redirect — callers return immediately.
+     */
+    private User requireReceiver(HttpServletRequest req, HttpServletResponse resp)
+            throws IOException {
+        HttpSession session = req.getSession(false);
+        Object u = null;
+        if (session != null) {
+            u = session.getAttribute("currentUser");
+        }
+        if (u instanceof User) {
+            User user = (User) u;
+            String role = user.getRoleName();
+            if ("CHU_QUAN_QUAN_TRI".equals(role) || "NHAN_VIEN".equals(role)) {
+                return user;
+            }
+        }
+        resp.sendRedirect(req.getContextPath() + "/authen?action=login");
+        return null;
+    }
+
+    /**
+     * Loads the picked PO + its items (with remaining context) for the form.
+     */
+    private void loadPoContext(HttpServletRequest req, long purchaseOrderId) {
+        PurchaseOrderDAO poDao = new PurchaseOrderDAO();
+        PurchaseOrder po = poDao.findById(purchaseOrderId);
+        req.setAttribute("order", po);
+        if (po != null) {
+            List<PurchaseOrderItem> poItems = poDao.findItems(purchaseOrderId);
+            // Lines still expecting stock come first-class — fully received
+            // ones are kept so repopulated rows still render, but flagged.
+            req.setAttribute("poItems", poItems);
+        }
+    }
+
+    /**
+     * Forward back to the form with errors + user input preserved.
+     */
+    private void repopulateForm(HttpServletRequest req, HttpServletResponse resp,
+            String mode, GoodsReceipt receipt, List<GoodsReceiptItem> items,
+            Map<String, String> errors)
+            throws ServletException, IOException {
+        req.setAttribute("errors", errors);
+        req.setAttribute("mode", mode);
+        req.setAttribute("receipt", receipt);
+        req.setAttribute("items", items);
+        req.setAttribute("receivableOrders", new PurchaseOrderDAO().findReceivable());
+        if (receipt.getPurchaseOrderId() != null && receipt.getPurchaseOrderId() > 0) {
+            loadPoContext(req, receipt.getPurchaseOrderId());
+        }
+        loadActiveZones(req);
+        req.getRequestDispatcher(FORM_JSP).forward(req, resp);
+    }
+
+    private void loadActiveZones(HttpServletRequest req) {
+        req.setAttribute("zones", new LocationDAO().findZones(null, "HOAT_DONG"));
+    }
+
+    private static String at(String[] arr, int i) {
+        if (arr == null || i >= arr.length) {
+            return "";
+        }
+        return arr[i];
+    }
+
+    private static int parsePage(String s) {
+        if (s == null || s.isEmpty()) {
+            return 1;
+        }
+        try {
+            int p = Integer.parseInt(s.trim());
+            return p < 1 ? 1 : p;
+        } catch (NumberFormatException e) {
+            return 1;
+        }
+    }
+
+    private static long parseId(String s) {
+        if (s == null) {
+            return -1;
+        }
+        try {
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static Long parseIdOrNull(String s) {
+        long v = parseId(s);
+        if (v > 0) {
+            return v;
+        }
+        return null;
+    }
+
+    private static Date parseDate(String s) {
+        String t = trim(s);
+        if (t.isEmpty()) {
+            return null;
+        }
+        try {
+            return Date.valueOf(t);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static String trimOrNull(String s) {
+        String t = trim(s);
+        if (t.isEmpty()) {
+            return null;
+        }
+        return t;
+    }
+
+    private static String trim(String s) {
+        return s == null ? "" : s.trim();
+    }
+}

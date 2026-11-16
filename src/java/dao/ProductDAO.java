@@ -1,0 +1,683 @@
+package dao;
+
+import db.DBContext;
+import model.Product;
+import model.ProductType;
+import java.sql.ResultSet;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Product queries: read for storefront + CRUD for admin. Extends DBContext per
+ * rule.md §20.
+ */
+public class ProductDAO extends DBContext {
+
+    private static final String BASE_COLS
+            = "p.product_id, p.category_id, p.product_name, p.sku, "
+            + "p.active_ingredient, p.strength, p.dosage_form, p.manufacturer, "
+            + "p.registration_number, p.product_type, p.selling_unit, p.selling_price, "
+            + "p.online_sale_allowed, p.status, "
+            + "p.short_description, p.indication, p.usage_instruction, p.warnings, p.contraindications, "
+            + "MAX(m.image_path) AS catalog_image_path, MAX(m.source_url) AS source_url, "
+            + "MAX(m.price_source_url) AS price_source_url, MAX(m.verified_at) AS verified_at, "
+            + "COALESCE(SUM(b.on_hand_quantity - b.reserved_quantity), 0) AS available_quantity ";
+
+    private static final String CATALOG_JOIN
+            = "LEFT JOIN product_catalog_details m ON m.product_id = p.product_id ";
+    private static final String CATALOG_VISIBLE
+            = "p.status = 'HOAT_DONG' AND c.status = 'HOAT_DONG' "
+            + "AND (p.online_sale_allowed = 1 OR m.catalog_visible = 1) ";
+
+    private static final Logger LOG = Logger.getLogger(ProductDAO.class.getName());
+
+    /**
+     * Maps one ResultSet row to a Product entity. Reused by every query.
+     */
+    public Product getFromResultSet(ResultSet rs) throws SQLException {
+        Product p = new Product();
+        p.setProductId(rs.getLong("product_id"));
+        p.setCategoryId(rs.getLong("category_id"));
+        p.setProductName(rs.getString("product_name"));
+        p.setSku(rs.getString("sku"));
+        p.setActiveIngredient(rs.getString("active_ingredient"));
+        p.setStrength(rs.getString("strength"));
+        p.setDosageForm(rs.getString("dosage_form"));
+        p.setManufacturer(rs.getString("manufacturer"));
+        p.setRegistrationNumber(rs.getString("registration_number"));
+        p.setShortDescription(rs.getString("short_description"));
+        p.setIndication(rs.getString("indication"));
+        p.setUsageInstruction(rs.getString("usage_instruction"));
+        p.setWarnings(rs.getString("warnings"));
+        p.setContraindications(rs.getString("contraindications"));
+        p.setProductType(ProductType.fromString(rs.getString("product_type")));
+        p.setSellingUnit(rs.getString("selling_unit"));
+        p.setSellingPrice(rs.getBigDecimal("selling_price"));
+        p.setOnlineSaleAllowed(rs.getBoolean("online_sale_allowed"));
+        p.setStatus(rs.getString("status"));
+        p.setAvailableQuantity(rs.getLong("available_quantity"));
+        p.setCatalogImagePath(rs.getString("catalog_image_path"));
+        p.setSourceUrl(rs.getString("source_url"));
+        p.setPriceSourceUrl(rs.getString("price_source_url"));
+        p.setVerifiedAt(rs.getDate("verified_at"));
+        try {
+            p.setCategoryName(rs.getString("category_name"));
+        } catch (SQLException ignored) {
+            /* column absent — query didn't join categories */ }
+        return p;
+    }
+
+    /**
+     * Online-saleable + HOAT_DONG products with computed available quantity.
+     * available_quantity = SUM(on_hand - reserved) over batches that are
+     * CO_SAN or SAP_HET_HAN and not past expiry_date. Single LEFT JOIN
+     * aggregate (no N+1).
+     *
+     * @param limit clamped upstream (1..200)
+     * @param categoryId optional — filter to one category
+     */
+    public List<Product> findOnlineSaleable(int limit, Long categoryId) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ").append(BASE_COLS);
+        sql.append("FROM products p ");
+        sql.append(CATALOG_JOIN);
+        sql.append("LEFT JOIN inventory_batches b ");
+        sql.append("  ON b.product_id = p.product_id ");
+        sql.append(" AND ").append(InventoryDAO.ALLOCATABLE).append(" ");
+        sql.append("WHERE p.status = 'HOAT_DONG' ");
+        sql.append("  AND p.online_sale_allowed = 1 AND p.product_type = 'KHONG_KE_DON' ");
+        if (categoryId != null) {
+            sql.append("  AND p.category_id = ? ");
+        }
+        sql.append("GROUP BY p.product_id ");
+        sql.append("ORDER BY p.product_id ASC ");
+        sql.append("LIMIT ?");
+
+        List<Product> out = new ArrayList<>();
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                LOG.log(Level.SEVERE, "No database connection available");
+                return out;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            int i = 1;
+            if (categoryId != null) {
+                statement.setLong(i++, categoryId);
+            }
+            statement.setInt(i, limit);
+            resultSet = statement.executeQuery();
+            while (resultSet.next()) {
+                out.add(getFromResultSet(resultSet));
+            }
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findOnlineSaleable failed", ex);
+        } finally {
+            closeResources();
+        }
+        return out;
+    }
+
+    /**
+     * Home "featured" strip: active, online, OTC products ranked by units
+     * sold. POS counts completed receipts. Online counts orders whose
+     * stock has already left and has not come back: đang giao, hoàn tất,
+     * and yêu cầu hoàn. Đã hoàn is excluded. Unsold products sort last.
+     */
+    public List<Product> findTopSellingOnline(int limit) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ").append(BASE_COLS);
+        sql.append("FROM products p ");
+        sql.append(CATALOG_JOIN);
+        sql.append("LEFT JOIN inventory_batches b ");
+        sql.append("  ON b.product_id = p.product_id ");
+        sql.append(" AND ").append(InventoryDAO.ALLOCATABLE).append(" ");
+        sql.append("LEFT JOIN (");
+        sql.append("  SELECT product_id, SUM(qty) AS sold_qty FROM (");
+        sql.append("    SELECT i.product_id, i.quantity AS qty ");
+        sql.append("    FROM sale_items i ");
+        sql.append("    JOIN sale_transactions st ON st.sale_transaction_id = i.sale_transaction_id ");
+        sql.append("    WHERE st.status = 'HOAN_TAT' ");
+        sql.append("    UNION ALL ");
+        sql.append("    SELECT oi.product_id, oi.quantity AS qty ");
+        sql.append("    FROM online_order_items oi ");
+        sql.append("    JOIN online_orders o ON o.online_order_id = oi.online_order_id ");
+        sql.append("    WHERE o.order_status IN ('DANG_GIAO','HOAN_TAT','YEU_CAU_HOAN') ");
+        sql.append("  ) sales GROUP BY product_id ");
+        sql.append(") sold ON sold.product_id = p.product_id ");
+        sql.append("WHERE p.status = 'HOAT_DONG' ");
+        sql.append("  AND p.online_sale_allowed = 1 ");
+        sql.append("  AND p.product_type = 'KHONG_KE_DON' ");
+        sql.append("GROUP BY p.product_id ");
+        sql.append("ORDER BY COALESCE(MAX(sold.sold_qty), 0) DESC, p.product_id ASC ");
+        sql.append("LIMIT ?");
+
+        List<Product> out = new ArrayList<>();
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return out;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            statement.setInt(1, limit);
+            resultSet = statement.executeQuery();
+            while (resultSet.next()) {
+                out.add(getFromResultSet(resultSet));
+            }
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findTopSellingOnline failed", ex);
+        } finally {
+            closeResources();
+        }
+        return out;
+    }
+
+    /**
+     * Online-saleable products excluding the given ids — the home health-care
+     * strip, so it does not repeat the featured products.
+     */
+    public List<Product> findOnlineSaleableExcluding(int limit, List<Long> excludeIds) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ").append(BASE_COLS);
+        sql.append("FROM products p ");
+        sql.append(CATALOG_JOIN);
+        sql.append("LEFT JOIN inventory_batches b ");
+        sql.append("  ON b.product_id = p.product_id ");
+        sql.append(" AND ").append(InventoryDAO.ALLOCATABLE).append(" ");
+        sql.append("WHERE p.status = 'HOAT_DONG' ");
+        sql.append("  AND p.online_sale_allowed = 1 ");
+        if (excludeIds != null && !excludeIds.isEmpty()) {
+            sql.append("  AND p.product_id NOT IN (");
+            for (int n = 0; n < excludeIds.size(); n++) {
+                if (n > 0) {
+                    sql.append(",");
+                }
+                sql.append("?");
+            }
+            sql.append(") ");
+        }
+        sql.append("GROUP BY p.product_id ");
+        sql.append("ORDER BY p.product_id ASC ");
+        sql.append("LIMIT ?");
+
+        List<Product> out = new ArrayList<>();
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return out;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            int i = 1;
+            if (excludeIds != null) {
+                for (Long id : excludeIds) {
+                    statement.setLong(i++, id);
+                }
+            }
+            statement.setInt(i, limit);
+            resultSet = statement.executeQuery();
+            while (resultSet.next()) {
+                out.add(getFromResultSet(resultSet));
+            }
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findOnlineSaleableExcluding failed", ex);
+        } finally {
+            closeResources();
+        }
+        return out;
+    }
+
+    /* ==================== Storefront catalog ==================== */
+    /**
+     * Active catalog entries, including explicitly listed reference-only items.
+     * Optional keyword, category, type, topic and current promotion filters. Same
+     * available_quantity aggregate as the admin query.
+     */
+    public List<Product> findCatalog(String keyword, Long categoryId, String productType,
+            int limit, int offset) {
+        return findCatalog(keyword, categoryId, productType, null, false, limit, offset);
+    }
+
+    public List<Product> findCatalog(String keyword, Long categoryId, String productType,
+            String topic, boolean promotionOnly, int limit, int offset) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ").append(BASE_COLS).append(", c.category_name ");
+        sql.append("FROM products p ");
+        sql.append(CATALOG_JOIN);
+        sql.append("LEFT JOIN categories c ON c.category_id = p.category_id ");
+        sql.append("LEFT JOIN inventory_batches b ");
+        sql.append("  ON b.product_id = p.product_id ");
+        sql.append(" AND ").append(InventoryDAO.ALLOCATABLE).append(" ");
+        appendCatalogFilters(sql, keyword, categoryId, productType, topic, promotionOnly);
+        sql.append("GROUP BY p.product_id ORDER BY p.product_name ASC LIMIT ? OFFSET ?");
+
+        List<Product> out = new ArrayList<>();
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return out;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            int i = bindCatalogFilters(statement, keyword, categoryId, productType);
+            statement.setInt(i++, limit);
+            statement.setInt(i, offset);
+            resultSet = statement.executeQuery();
+            while (resultSet.next()) {
+                out.add(getFromResultSet(resultSet));
+            }
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findCatalog failed", ex);
+        } finally {
+            closeResources();
+        }
+        return out;
+    }
+
+    /**
+     * Row count for catalog paging (same filters as findCatalog).
+     */
+    public int countCatalog(String keyword, Long categoryId, String productType) {
+        return countCatalog(keyword, categoryId, productType, null, false);
+    }
+
+    public int countCatalog(String keyword, Long categoryId, String productType,
+            String topic, boolean promotionOnly) {
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM products p ");
+        sql.append(CATALOG_JOIN);
+        sql.append("LEFT JOIN categories c ON c.category_id = p.category_id ");
+        appendCatalogFilters(sql, keyword, categoryId, productType, topic, promotionOnly);
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return 0;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            bindCatalogFilters(statement, keyword, categoryId, productType);
+            resultSet = statement.executeQuery();
+            if (resultSet.next()) {
+                return resultSet.getInt(1);
+            }
+            return 0;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "countCatalog failed", ex);
+            return 0;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * Storefront detail: single active, visible catalog product with
+     * category name + available quantity.
+     */
+    public Product findStorefrontById(long productId) {
+        String sql = "SELECT " + BASE_COLS + ", c.category_name "
+                + "FROM products p "
+                + CATALOG_JOIN
+                + "LEFT JOIN categories c ON c.category_id = p.category_id "
+                + "LEFT JOIN inventory_batches b "
+                + "  ON b.product_id = p.product_id "
+                + " AND " + InventoryDAO.ALLOCATABLE + " "
+                + "WHERE p.product_id = ? AND " + CATALOG_VISIBLE
+                + "GROUP BY p.product_id LIMIT 1";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return null;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setLong(1, productId);
+            resultSet = statement.executeQuery();
+            if (resultSet.next()) {
+                return getFromResultSet(resultSet);
+            }
+            return null;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findStorefrontById failed", ex);
+            return null;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /** Shared predicates keep totals and page results consistent for combined filters. */
+    private void appendCatalogFilters(StringBuilder sql, String keyword, Long categoryId,
+            String productType, String topic, boolean promotionOnly) {
+        sql.append("WHERE ").append(CATALOG_VISIBLE);
+        if (keyword != null && !keyword.isEmpty()) {
+            sql.append("AND (p.product_name LIKE ? OR p.active_ingredient LIKE ? OR p.manufacturer LIKE ?) ");
+        }
+        if (categoryId != null) {
+            sql.append("AND p.category_id = ? ");
+        }
+        if (productType != null) {
+            sql.append("AND p.product_type = ? ");
+        }
+        if ("health".equals(topic)) {
+            sql.append("AND (m.health_care = 1 OR c.category_name = 'Vitamin và thực phẩm bổ sung') ");
+        } else if ("mother-baby".equals(topic)) {
+            sql.append("AND m.mother_baby = 1 ");
+        } else if (topic != null) {
+            sql.append("AND 1 = 0 ");
+        }
+        if (promotionOnly) {
+            sql.append("AND p.product_type = 'KHONG_KE_DON' AND p.online_sale_allowed = 1 ");
+            sql.append("AND m.promotion_label IS NOT NULL AND m.promotion_label <> '' ");
+            sql.append("AND m.promotion_source_url IS NOT NULL AND m.promotion_source_url <> '' ");
+            sql.append("AND m.promotion_from <= CURDATE() AND m.promotion_until >= CURDATE() ");
+        }
+    }
+
+    private int bindCatalogFilters(PreparedStatement st, String keyword, Long categoryId,
+            String productType) throws SQLException {
+        int index = 1;
+        if (keyword != null && !keyword.isEmpty()) {
+            String like = "%" + keyword + "%";
+            st.setString(index++, like);
+            st.setString(index++, like);
+            st.setString(index++, like);
+        }
+        if (categoryId != null) {
+            st.setLong(index++, categoryId);
+        }
+        if (productType != null) {
+            st.setString(index++, productType);
+        }
+        return index;
+    }
+
+    /* ==================== Admin ==================== */
+    /**
+     * Admin list — all statuses, optional keyword (name/sku) + category
+     * + type + status filter, newest first, LIMIT/OFFSET paging.
+     */
+    public List<Product> findAll(String keyword, Long categoryId, String productType,
+            String status, int limit, int offset) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ").append(BASE_COLS);
+        sql.append(", c.category_name ");
+        sql.append("FROM products p ");
+        sql.append(CATALOG_JOIN);
+        sql.append("LEFT JOIN categories c ON c.category_id = p.category_id ");
+        sql.append("LEFT JOIN inventory_batches b ");
+        sql.append("  ON b.product_id = p.product_id ");
+        sql.append(" AND ").append(InventoryDAO.ALLOCATABLE).append(" ");
+        sql.append("WHERE 1=1 ");
+        if (keyword != null && !keyword.isEmpty()) {
+            sql.append("AND (p.product_name LIKE ? OR p.sku LIKE ?) ");
+        }
+        if (categoryId != null) {
+            sql.append("AND p.category_id = ? ");
+        }
+        if (productType != null) {
+            sql.append("AND p.product_type = ? ");
+        }
+        if (status != null) {
+            sql.append("AND p.status = ? ");
+        }
+        sql.append("GROUP BY p.product_id ORDER BY p.product_id DESC LIMIT ? OFFSET ?");
+
+        List<Product> out = new ArrayList<>();
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return out;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            int i = 1;
+            if (keyword != null && !keyword.isEmpty()) {
+                String like = "%" + keyword + "%";
+                statement.setString(i++, like);
+                statement.setString(i++, like);
+            }
+            if (categoryId != null) {
+                statement.setLong(i++, categoryId);
+            }
+            if (productType != null) {
+                statement.setString(i++, productType);
+            }
+            if (status != null) {
+                statement.setString(i++, status);
+            }
+            statement.setInt(i++, limit);
+            statement.setInt(i, offset);
+            resultSet = statement.executeQuery();
+            while (resultSet.next()) {
+                out.add(getFromResultSet(resultSet));
+            }
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findAll failed", ex);
+        } finally {
+            closeResources();
+        }
+        return out;
+    }
+
+    /**
+     * Row count for paging (same filters as findAll).
+     */
+    public int countAll(String keyword, Long categoryId, String productType, String status) {
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM products p WHERE 1=1 ");
+        if (keyword != null && !keyword.isEmpty()) {
+            sql.append("AND (p.product_name LIKE ? OR p.sku LIKE ?) ");
+        }
+        if (categoryId != null) {
+            sql.append("AND p.category_id = ? ");
+        }
+        if (productType != null) {
+            sql.append("AND p.product_type = ? ");
+        }
+        if (status != null) {
+            sql.append("AND p.status = ? ");
+        }
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return 0;
+            }
+            statement = connection.prepareStatement(sql.toString());
+            int i = 1;
+            if (keyword != null && !keyword.isEmpty()) {
+                String like = "%" + keyword + "%";
+                statement.setString(i++, like);
+                statement.setString(i++, like);
+            }
+            if (categoryId != null) {
+                statement.setLong(i++, categoryId);
+            }
+            if (productType != null) {
+                statement.setString(i++, productType);
+            }
+            if (status != null) {
+                statement.setString(i++, status);
+            }
+            resultSet = statement.executeQuery();
+            if (resultSet.next()) {
+                return resultSet.getInt(1);
+            }
+            return 0;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "countAll failed", ex);
+            return 0;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * Single product by PK — includes available_quantity aggregate for stock
+     * info.
+     */
+    public Product findById(long productId) {
+        String sql = "SELECT " + BASE_COLS
+                + "FROM products p " + CATALOG_JOIN + "LEFT JOIN inventory_batches b "
+                + "  ON b.product_id = p.product_id "
+                + " AND " + InventoryDAO.ALLOCATABLE + " "
+                + "WHERE p.product_id = ? GROUP BY p.product_id LIMIT 1";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return null;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setLong(1, productId);
+            resultSet = statement.executeQuery();
+            if (resultSet.next()) {
+                return getFromResultSet(resultSet);
+            }
+            return null;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "findById failed", ex);
+            return null;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /** Unique check — sku (exclude self when editing). */
+    public boolean existsBySku(String sku, long excludeId) {
+        return existsWhere("SELECT 1 FROM products WHERE sku = ? AND product_id <> ? LIMIT 1", sku, excludeId);
+    }
+
+    private boolean existsWhere(String sql, String value, long excludeId) {
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return false;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setString(1, value);
+            statement.setLong(2, excludeId);
+            resultSet = statement.executeQuery();
+            return resultSet.next();
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "existsWhere failed", ex);
+            return false;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * INSERT new product. Returns generated id or -1.
+     */
+    public long create(Product p) {
+        String sql = "INSERT INTO products (category_id, product_name, sku, "
+                + "active_ingredient, strength, dosage_form, manufacturer, registration_number, "
+                + "short_description, indication, usage_instruction, warnings, contraindications, "
+                + "product_type, selling_unit, selling_price, online_sale_allowed, status) "
+                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return -1;
+            }
+            statement = connection.prepareStatement(sql, java.sql.Statement.RETURN_GENERATED_KEYS);
+            bindProduct(statement, p);
+            statement.executeUpdate();
+            resultSet = statement.getGeneratedKeys();
+            if (resultSet.next()) {
+                return resultSet.getLong(1);
+            }
+            return -1;
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "create failed", ex);
+            return -1;
+        } finally {
+            closeResources();
+        }
+    }
+
+    public int update(Product p) {
+        String sql = "UPDATE products SET category_id=?, product_name=?, sku=?, "
+                + "active_ingredient=?, strength=?, dosage_form=?, manufacturer=?, registration_number=?, "
+                + "short_description=?, indication=?, usage_instruction=?, warnings=?, contraindications=?, "
+                + "product_type=?, selling_unit=?, selling_price=?, online_sale_allowed=?, status=? "
+                + "WHERE product_id=?";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return 0;
+            }
+            statement = connection.prepareStatement(sql);
+            int i = bindProduct(statement, p);
+            statement.setLong(i, p.getProductId());
+            return statement.executeUpdate();
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "update failed", ex);
+            return 0;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * Soft delete → NGUNG_HOAT_DONG (kept for order/batch history).
+     */
+    public int deactivate(long productId) {
+        String sql = "UPDATE products SET status='NGUNG_HOAT_DONG' WHERE product_id=?";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return 0;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setLong(1, productId);
+            return statement.executeUpdate();
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "deactivate failed", ex);
+            return 0;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * Restore → HOAT_DONG.
+     */
+    public int activate(long productId) {
+        String sql = "UPDATE products SET status='HOAT_DONG' WHERE product_id=?";
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                return 0;
+            }
+            statement = connection.prepareStatement(sql);
+            statement.setLong(1, productId);
+            return statement.executeUpdate();
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, "activate failed", ex);
+            return 0;
+        } finally {
+            closeResources();
+        }
+    }
+
+    /**
+     * Shared bind for INSERT/UPDATE. Returns the next parameter index.
+     */
+    private int bindProduct(java.sql.PreparedStatement st, Product p) throws SQLException {
+        st.setLong(1, p.getCategoryId());
+        st.setString(2, p.getProductName());
+        st.setString(3, p.getSku());
+        st.setString(4, p.getActiveIngredient());
+        st.setString(5, p.getStrength());
+        st.setString(6, p.getDosageForm());
+        st.setString(7, p.getManufacturer());
+        st.setString(8, p.getRegistrationNumber());
+        st.setString(9, p.getShortDescription());
+        st.setString(10, p.getIndication());
+        st.setString(11, p.getUsageInstruction());
+        st.setString(12, p.getWarnings());
+        st.setString(13, p.getContraindications());
+        st.setString(14, p.getProductType() == null ? "KHONG_KE_DON" : p.getProductType().name());
+        st.setString(15, p.getSellingUnit());
+        st.setBigDecimal(16, p.getSellingPrice());
+        st.setBoolean(17, Boolean.TRUE.equals(p.getOnlineSaleAllowed()));
+        st.setString(18, p.getStatus() == null ? "HOAT_DONG" : p.getStatus());
+        return 19;
+    }
+}

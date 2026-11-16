@@ -1,0 +1,274 @@
+<%@ page contentType="text/html; charset=UTF-8" pageEncoding="UTF-8" %>
+<%@ taglib prefix="c" uri="jakarta.tags.core" %>
+<%@ taglib prefix="fmt" uri="jakarta.tags.fmt" %>
+<c:set var="ctx" value="${pageContext.request.contextPath}"/>
+<c:set var="adminNav" value="online-orders"/>
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <%@ include file="/WEB-INF/jspf/admin-head.jspf" %>
+    <title>Đơn #${order.onlineOrderId} — Chuẩn bị đơn — PharmaFlow</title>
+</head>
+<body class="admin-layout">
+
+<%@ include file="/WEB-INF/jspf/admin-nav.jspf" %>
+
+<div class="admin-shell">
+    <%@ include file="/WEB-INF/jspf/admin-sidebar.jspf" %>
+
+    <main class="admin-main">
+        <div class="section-head">
+            <div>
+                <h2>Đơn hàng #<c:out value="${order.onlineOrderId}"/></h2>
+                <p class="section-sub">
+                    Đặt lúc <fmt:formatDate value="${order.createdAt}" pattern="yyyy-MM-dd HH:mm"/>
+                    — lấy đúng các lô đã giữ bên dưới.
+                </p>
+            </div>
+            <a class="btn btn-ghost" href="${ctx}/fulfillment">← Quay lại danh sách</a>
+        </div>
+
+        <c:if test="${not empty param.ok}">
+            <div class="alert alert-success" role="status">
+                <c:choose>
+                    <c:when test="${param.ok == 'confirmed'}">Đã xác nhận đơn hàng.</c:when>
+                    <c:when test="${param.ok == 'prepared'}">Đã bắt đầu chuẩn bị đơn hàng.</c:when>
+                    <c:when test="${param.ok == 'ready'}">Đơn hàng đã sẵn sàng để giao.</c:when>
+                    <c:when test="${param.ok == 'rejected'}">Đã từ chối đơn hàng và giải phóng hàng đã giữ.</c:when>
+                    <c:when test="${param.ok == 'return_accepted'}">Đã chấp nhận hoàn đơn và nhập lại tồn kho.</c:when>
+                    <c:when test="${param.ok == 'return_rejected'}">Đã từ chối yêu cầu hoàn. Đơn trở về hoàn tất.</c:when>
+                    <c:otherwise>Thao tác thành công.</c:otherwise>
+                </c:choose>
+            </div>
+        </c:if>
+        <c:if test="${not empty param.err}">
+            <div class="alert alert-error" role="alert">
+                <c:choose>
+                    <c:when test="${param.err == 'ORDER_NOT_FOUND'}">Không tìm thấy đơn hàng.</c:when>
+                    <c:when test="${param.err == 'INVALID_STATUS'}">Đơn hàng không thể thực hiện thao tác này ở trạng thái hiện tại.</c:when>
+                    <c:when test="${param.err == 'RESERVATION_MISMATCH'}">Dữ liệu giữ hàng của đơn không còn hợp lệ. Vui lòng kiểm tra tồn kho.</c:when>
+                    <c:when test="${param.err == 'RESERVATION_NOT_FOUND'}">Đơn hàng không có dữ liệu giữ hàng. Vui lòng kiểm tra tồn kho.</c:when>
+                    <c:when test="${param.err == 'PAYMENT_REQUIRED'}">Đơn VNPAY chưa được thanh toán — không thể xác nhận.</c:when>
+                    <c:when test="${param.err == 'ONLINE_PAYMENT_REJECT_NOT_SUPPORTED'}">Không thể từ chối đơn thanh toán trực tuyến (chưa có hoàn tiền).</c:when>
+                    <c:when test="${param.err == 'BIN_NOT_FOUND'}">Không tìm thấy ngăn kho của lô đã xuất để nhập lại hàng hoàn.</c:when>
+                    <c:otherwise>Đã có lỗi xảy ra, vui lòng thử lại.</c:otherwise>
+                </c:choose>
+            </div>
+        </c:if>
+
+        <div class="profile-card">
+            <fieldset class="profile-group">
+                <legend>Thông tin đơn hàng</legend>
+                <div class="profile-grid">
+                    <div class="form-field">
+                        <label>Mã đơn</label>
+                        <span>#<c:out value="${order.onlineOrderId}"/></span>
+                    </div>
+                    <div class="form-field">
+                        <label>Ngày đặt</label>
+                        <span><fmt:formatDate value="${order.createdAt}" pattern="yyyy-MM-dd HH:mm"/></span>
+                    </div>
+                    <div class="form-field">
+                        <label>Trạng thái</label>
+                        <span class="status-badge ${order.statusCss}">
+                            <c:out value="${order.statusLabel}"/>
+                        </span>
+                    </div>
+                    <div class="form-field">
+                        <label>Thanh toán</label>
+                        <span>
+                            <c:out value="${order.paymentLabel}"/>
+                            <span class="field-hint">(<c:out value="${order.paymentStatusLabel}"/>)</span>
+                        </span>
+                    </div>
+                    <div class="form-field">
+                        <label>Tổng tiền</label>
+                        <span><fmt:formatNumber value="${order.totalAmount}" type="number" groupingUsed="true"/>&#x20AB;</span>
+                    </div>
+                </div>
+            </fieldset>
+
+            <fieldset class="profile-group">
+                <legend>Thông tin giao hàng</legend>
+                <div class="profile-grid">
+                    <div class="form-field">
+                        <label>Người nhận</label>
+                        <span><c:out value="${order.customerName}"/></span>
+                    </div>
+                    <div class="form-field">
+                        <label>Số điện thoại</label>
+                        <span><c:out value="${order.customerPhone}"/></span>
+                    </div>
+                    <div class="form-field">
+                        <label>Tỉnh / Thành phố</label>
+                        <span><c:out value="${order.provinceCity}"/></span>
+                    </div>
+                    <div class="form-field">
+                        <label>Quận / Huyện</label>
+                        <span><c:out value="${order.district}"/></span>
+                    </div>
+                    <div class="form-field">
+                        <label>Phường / Xã</label>
+                        <span><c:out value="${order.ward}"/></span>
+                    </div>
+                    <div class="form-field">
+                        <label>Địa chỉ chi tiết</label>
+                        <span><c:out value="${order.detailedAddress}"/></span>
+                    </div>
+                </div>
+            </fieldset>
+
+            <fieldset class="profile-group">
+                <legend>Sản phẩm &amp; lô đã giữ</legend>
+                <table class="admin-table">
+                    <thead>
+                    <tr>
+                        <th>Sản phẩm</th>
+                        <th>SKU</th>
+                        <th class="col-num">Đã đặt</th>
+                        <th>Đơn vị</th>
+                        <th class="col-price">Đơn giá</th>
+                        <th class="col-price">Thành tiền</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <c:forEach var="item" items="${items}">
+                        <tr>
+                            <td><c:out value="${item.productName}"/></td>
+                            <td><c:out value="${item.sku}"/></td>
+                            <td><c:out value="${item.quantity}"/></td>
+                            <td><c:out value="${item.sellingUnit}"/></td>
+                            <td><fmt:formatNumber value="${item.unitPrice}" type="number" groupingUsed="true"/>&#x20AB;</td>
+                            <td><fmt:formatNumber value="${item.subtotal}" type="number" groupingUsed="true"/>&#x20AB;</td>
+                        </tr>
+                        <%-- Reserved batch allocations for this line — the picking list --%>
+                        <tr class="pick-row">
+                            <td colspan="6" class="pick-cell">
+                                <c:forEach var="r" items="${reservations}">
+                                    <c:if test="${r.onlineOrderItemId == item.onlineOrderItemId}">
+                                        <div class="pick-line">
+                                            <span class="pick-label">Lấy:</span>
+                                            <span class="pick-batch">Lô <c:out value="${r.batchNumber}"/></span>
+                                            <span class="pick-exp">HSD <fmt:formatDate value="${r.expiryDate}" pattern="yyyy-MM-dd"/></span>
+                                            <span class="pick-loc"><c:out value="${r.storageLocation}"/></span>
+                                            <span class="pick-qty"><c:out value="${r.reservedQuantity}"/></span>
+                                            <c:if test="${r.status != 'DANG_GIU'}">
+                                                <span class="pick-released">(đã giải phóng)</span>
+                                            </c:if>
+                                        </div>
+                                    </c:if>
+                                </c:forEach>
+                            </td>
+                        </tr>
+                    </c:forEach>
+                    </tbody>
+                </table>
+            </fieldset>
+
+            <div class="profile-actions">
+                <%-- Action buttons: only the valid state-changing ones per status
+                     + payment. COD: confirm + reject as before. VNPAY pending:
+                     no action (waiting on the customer). VNPAY paid: confirm
+                     only — reject needs a refund flow that does not exist. --%>
+                <c:if test="${order.orderStatus == 'CHO_XU_LY'}">
+                    <c:choose>
+                        <c:when test="${order.paymentMethod == 'THANH_TOAN_KHI_NHAN_HANG'}">
+                            <form method="post" action="${ctx}/fulfillment?action=confirm" class="inline-form"
+                                  onsubmit="var c = confirm('Xác nhận đơn hàng này?'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                                <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                                <button type="submit" class="btn btn-primary">Xác nhận đơn</button>
+                            </form>
+                            <form method="post" action="${ctx}/fulfillment?action=reject" class="inline-form"
+                                  onsubmit="var c = confirm('Từ chối đơn hàng này? Hàng đã giữ sẽ được giải phóng.'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                                <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                                <button type="submit" class="btn btn-ghost btn-danger">Từ chối đơn</button>
+                            </form>
+                        </c:when>
+                        <c:when test="${order.paymentMethod == 'THANH_TOAN_TRUC_TUYEN'
+                                          && order.paymentStatus == 'DA_THANH_TOAN'}">
+                            <form method="post" action="${ctx}/fulfillment?action=confirm" class="inline-form"
+                                  onsubmit="var c = confirm('Xác nhận đơn hàng này?'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                                <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                                <button type="submit" class="btn btn-primary">Xác nhận đơn</button>
+                            </form>
+                        </c:when>
+                        <c:when test="${order.paymentMethod == 'THANH_TOAN_TRUC_TUYEN'
+                                          && order.paymentStatus == 'CHO_THANH_TOAN'}">
+                            <p class="field-hint">Đang chờ khách hàng hoàn tất thanh toán VNPAY.</p>
+                        </c:when>
+                    </c:choose>
+                </c:if>
+                <c:if test="${order.orderStatus == 'DA_XAC_NHAN'}">
+                    <form method="post" action="${ctx}/fulfillment?action=prepare" class="inline-form"
+                          onsubmit="var c = confirm('Bắt đầu chuẩn bị đơn hàng này?'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                        <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                        <button type="submit" class="btn btn-primary">Bắt đầu chuẩn bị</button>
+                    </form>
+                </c:if>
+                <c:if test="${order.orderStatus == 'DANG_CHUAN_BI'}">
+                    <form method="post" action="${ctx}/fulfillment?action=ready" class="inline-form"
+                          onsubmit="var c = confirm('Đánh dấu đơn hàng đã sẵn sàng?'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                        <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                        <button type="submit" class="btn btn-primary">Đánh dấu sẵn sàng</button>
+                    </form>
+                </c:if>
+                <c:if test="${order.orderStatus == 'SAN_SANG'}">
+                    <p class="field-hint">Đơn hàng đang chờ bàn giao cho nhân viên giao hàng.</p>
+                </c:if>
+                <c:if test="${order.orderStatus == 'DANG_GIAO'}">
+                    <p class="field-hint">Đơn đang giao. Trạng thái khách hàng là Đang giao.</p>
+                </c:if>
+                <c:if test="${order.orderStatus == 'YEU_CAU_HUY'}">
+                    <p class="field-hint">Khách đã yêu cầu hủy. Chờ shipper xác nhận đã thu hồi hàng.</p>
+                </c:if>
+                <c:if test="${order.orderStatus == 'CHO_KIEM_HUY'}">
+                    <p class="field-hint">Shipper đã thu hồi hàng. Chỉ nhập lại kho khi hàng không có vấn đề.</p>
+                    <form method="post" action="${ctx}/fulfillment?action=accept-cancel" class="inline-form"
+                          onsubmit="var c = confirm('Hàng không có vấn đề và được nhập lại kho?'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                        <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                        <button type="submit" class="btn btn-primary">Không có vấn đề — nhập kho</button>
+                    </form>
+                    <form method="post" action="${ctx}/fulfillment?action=reject-cancel" class="inline-form"
+                          onsubmit="return confirm('Ghi nhận hàng có vấn đề và không nhập kho?');">
+                        <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                        <div class="form-field">
+                            <label for="cancelReason">Lý do không nhập kho</label>
+                            <textarea id="cancelReason" name="reason" rows="2" maxlength="500" required></textarea>
+                        </div>
+                        <button type="submit" class="btn btn-ghost btn-danger">Có vấn đề — không nhập kho</button>
+                    </form>
+                </c:if>
+                <c:if test="${order.orderStatus == 'HUY_CO_VAN_DE'}">
+                    <p class="field-hint">Hàng hủy có vấn đề, chưa nhập lại kho.
+                        <c:if test="${not empty order.returnReason}">Lý do: <c:out value="${order.returnReason}"/></c:if>
+                    </p>
+                </c:if>
+                <c:if test="${order.orderStatus == 'YEU_CAU_HOAN'}">
+                    <p class="field-hint">Lý do hoàn: <c:out value="${order.returnReason}"/></p>
+                    <form method="post" action="${ctx}/fulfillment?action=accept-return" class="inline-form"
+                          onsubmit="var c = confirm('Chấp nhận hoàn đơn và nhập lại tồn kho?'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                        <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                        <button type="submit" class="btn btn-primary">Chấp nhận hoàn</button>
+                    </form>
+                    <form method="post" action="${ctx}/fulfillment?action=reject-return" class="inline-form"
+                          onsubmit="var c = confirm('Từ chối yêu cầu hoàn? Đơn trở về hoàn tất.'); if (c) { var b = this.querySelector('button'); if (b) b.disabled = true; } return c;">
+                        <input type="hidden" name="orderId" value="${order.onlineOrderId}">
+                        <button type="submit" class="btn btn-ghost btn-danger">Từ chối hoàn</button>
+                    </form>
+                </c:if>
+                <c:if test="${order.orderStatus == 'DA_HOAN'}">
+                    <p class="field-hint">Đơn đã hoàn. Hàng đã nhập lại kho.
+                        <c:if test="${order.paymentMethod == 'THANH_TOAN_TRUC_TUYEN'}">
+                            Tiền VNPAY không được hoàn tự động.
+                        </c:if>
+                    </p>
+                </c:if>
+            </div>
+        </div>
+    </main>
+</div>
+
+<%@ include file="/WEB-INF/jspf/admin-footer.jspf" %>
+
+</body>
+</html>
